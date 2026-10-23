@@ -55,6 +55,7 @@
 | `persist.sys.fkoscreen.hdr_native` | 1 | 是否挂原生驱动（0=只用兜底） |
 | `persist.sys.fkoscreen.hdr_fallback` | 1 | 是否允许兜底（0=只走原生，用于验证） |
 | `persist.sys.fkoscreen.hdr_factor` | 100 | 提亮倍数上限，实际由面板 nit 截断 |
+| `persist.sys.fkoscreen.hdr_ratio_max` | 空 | 人工指定比值上限；空=按面板自适应（见第七章） |
 
 ## 四、实测矩阵（C16 / OPD2404 / Android 16）
 
@@ -68,6 +69,50 @@
 | 停止播放 | `HDR -> false` | 1.0 | 800 / 800 | 正常回退 |
 | 纯原生（`hdr_fallback=0`） | `fallback disabled` | 7.19 | 2047 / 800 | 原生链路可独立工作 |
 | 纯兜底（`hdr_native=0`） | `boost nit ...` | 7.19 | 2047 / 800 | 兜底链路可独立工作 |
+
+## 四之二、比值上限：面板自适应分级推导（v1.8.0）
+
+不写死任何数字，三级降级：
+
+| 档 | 来源 | 适用 |
+|---|---|---|
+| ① | `persist.sys.fkoscreen.hdr_ratio_max` | 人工覆盖 |
+| ② | `DisplayDeviceConfig.hasSdrToHdrRatioSpline()` + `getHdrBrightnessFromSdr()` | 厂商为该屏写了 nits→ratio 曲线时自动生效 |
+| ③ | `getMaxPanelNit() / sdrNit` | 面板未声明曲线时，交给物理峰值 |
+
+②的换算（与 `hdrSdrRatio` 同量纲）：
+
+```
+sdrBrightness = curve("backlights", sdrNit)
+hdrBrightness = config.getHdrBrightnessFromSdr(sdrBrightness, MAX)
+hdrNit        = curve("nits", hdrBrightness)
+cap           = hdrNit / sdrNit
+```
+
+**本机结论**：`sdrToHdrSpline=false`（OPPO 未给这块屏写比值曲线）→ 落第③档，
+比值由 `面板顶满 nit / SDR 白点 nit` 决定，实测：
+
+| SDR 亮度 | ratio | brightness / sdr |
+|---:|---:|---|
+| 400 | 17.807 | 2047 / 400 |
+| 800 | 7.191 | 2047 / 800 |
+| 1400 | 2.544 | 2047 / 1400 |
+| 2047 | 1.0 | 2047 / 2047 |
+
+## 四之三、HBM 与峰值亮度的实测结论
+
+用**功耗法**判定（本机 sysfs 的 `hbm` 节点与 HBM 无关，是误导项）：
+
+| 状态 | `current_now` | 背光 `bl` | 结论 |
+|---|---:|---:|---|
+| SDR 800 | −114 mA（净充电） | 800 | 常规 |
+| SDR 1798（normal max） | 967 mA | 1798 | 常规上限 |
+| SDR 2047（**HBM 区间**） | **1783 mA** | 2047 | **+816 mA，HBM 生效** |
+| **HDR ON** | **1817 mA** | **2047** | **与手动拉满同级 → HDR 已进 HBM** |
+
+**结论**：HBM 不需要单独控制——它是 `brightness > 1798` 的自然结果；
+模块把 brightness 顶到 `RangeMaximum=2047`，HBM 就自动激发。
+`/sys/kernel/oplus_display/hbm` 写 1 无效且不改背光，属无关节点。
 
 ## 五、关键 bug 复盘
 
