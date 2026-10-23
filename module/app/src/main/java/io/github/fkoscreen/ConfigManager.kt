@@ -105,7 +105,15 @@ object ConfigManager {
 
     fun isFossBypassEnabled(): Boolean = getBooleanConfig(KEY_FOSS_BYPASS, true)
 
-    fun isHdrRatioEnabled(): Boolean = getBooleanConfig(KEY_HDR_RATIO, true)
+    /**
+     * HDR 提亮修复开关。
+     * 语义已变更：不再是「锁定 hdrSdrRatio 为 1.56」，而是「按面板硬件上限恢复 SDR/HDR 比值」——
+     * HDR 关闭时比值回落 1.0，开启时面板 nit 抬到 getMaxPanelNit() 上限、SDR 白点不动。
+     */
+    fun isHdrFixEnabled(): Boolean = getBooleanConfig(KEY_HDR_RATIO, true)
+
+    @Deprecated("已由 isHdrFixEnabled 取代")
+    fun isHdrRatioEnabled(): Boolean = isHdrFixEnabled()
 
     fun isDarkModeStylesEnabled(): Boolean = getBooleanConfig(KEY_DARK_MODE_STYLES, true)
 

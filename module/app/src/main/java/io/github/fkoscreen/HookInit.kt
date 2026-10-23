@@ -39,7 +39,8 @@ class HookInit : IXposedHookLoadPackage {
             }
             "com.android.systemui" -> {
                 XposedBridge.log("$TAG: Hooking com.android.systemui (HDR & QuickSettings)...")
-                // 注意：不再使用 HdrRatioHook 伪造 DisplayInfo.hdrSdrRatio（只骗读者、不提亮）
+                // 旧 HdrRatioHook（写死 1.5625 伪造 DisplayInfo.hdrSdrRatio）已删除：
+                // 只骗读者、不提亮。现在由 HdrBoostHook 按硬件上限恢复真实比值。
                 BrightnessLimitHook.initSystemUI(lpparam.classLoader)
                 AodBrightnessHook.init(lpparam.classLoader)
             }

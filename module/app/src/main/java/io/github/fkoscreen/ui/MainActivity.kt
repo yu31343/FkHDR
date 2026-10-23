@@ -250,8 +250,8 @@ fun MainScreen() {
                     }
                 )
                 SwitchPreference(
-                    title = "修复 HDR 亮度比例",
-                    summary = "锁定 hdrSdrRatio 为 1.56，正常显示 Ultra HDR 高光",
+                    title = "HDR 提亮修复",
+                    summary = "按面板硬件上限恢复 SDR/HDR 比值：HDR 开时面板提亮，关时比值动画回落 1.0",
                     checked = hdrRatio,
                     onCheckedChange = {
                         hdrRatio = it

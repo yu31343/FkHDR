@@ -15,6 +15,12 @@ import de.robv.android.xposed.XposedHelpers
  * 3) ColorOS 提亮只改面板 nit，Builder.setNit() 顺手把 sdrNit 也改成同值 ->
  *    面板亮了但 hdrSdrRatio 恒 1。
  *
+ * ── 关于「HDR 亮度比例」────────────────────────────────────
+ * 不再使用任何写死的比率（旧实现的 1.5625 已删除）。比值完全由系统按**面板硬件上限**推导：
+ *   ratio = 面板 nit(getMaxPanelNit()) / SDR 白点 nit
+ * 所以亮度越低比值越大（低亮度余量多），亮度拉满时自然回落到 1.0；
+ * HDR 关闭后 SDR 白点与面板重新相等，比值动画回落 1.0。
+ *
  * ── 设计原则 ────────────────────────────────────────────────
  * · 亮度算法不实现：优先驱动 ColorOS 自己的 OplusFeatureHDREnhanceBrightness
  *   （enterEnhanceBrightness / exitEnhanceBrightness，含它自己的动画与硬件上限 clamp）。
@@ -77,7 +83,16 @@ object HdrBoostHook {
         def
     }
 
-    private fun enabled() = prop(PROP_ENABLE, "1").let { it != "0" && !it.equals("false", true) }
+    /** 开关优先级：系统属性 > 模块界面开关（复用原 hdr_ratio_fix 键） */
+    private fun enabled(): Boolean {
+        val p = prop(PROP_ENABLE, "")
+        if (p.isNotEmpty()) return p != "0" && !p.equals("false", true)
+        return try {
+            io.github.fkoscreen.ConfigManager.isHdrFixEnabled()
+        } catch (_: Throwable) {
+            true
+        }
+    }
 
     /** 提亮倍数；默认 100 -> 由 ColorOS 自己 clamp 到 getMaxPanelNit() 硬件上限 */
     private fun factor() = prop(PROP_FACTOR, "100").toFloatOrNull()?.takeIf { it > 1f } ?: 100f
