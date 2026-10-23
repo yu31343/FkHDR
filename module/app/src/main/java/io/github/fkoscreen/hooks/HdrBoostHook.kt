@@ -670,7 +670,13 @@ object HdrBoostHook {
             }
         }
         var n = hookAll(cls, "onPlaybackStateChanged", hook)
-        n += hookAll(cls, "addSession", hook)
+        n += hookAll(cls, "addSession", object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                recheckNow()
+                if (!enabled() || !videoEnabled()) return
+                noteSession(param.args.getOrNull(0) ?: return)
+            }
+        })
         n += hookAll(cls, "removeSession", object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val rec = param.args.getOrNull(0) ?: return
@@ -751,8 +757,98 @@ object HdrBoostHook {
         }
         val pkg = focusedPackage() ?: return false
         if (!playingPkgs.containsKey(pkg) && !sessionPkgs.containsKey(pkg)) return false
-        // 全屏 + 该应用自己有媒体会话 => 视为在放视频
-        return focusedWindowFullscreen()
+        // 只要该应用有媒体会话即算（不再要求全屏/半屏，HDR 内容为准）
+        // ★ 关键闸门：必须拿到「HDR 内容」证据，普通 SDR 视频一律不提亮。
+        // 证据来自 SurfaceFlinger：图层携带 HDR 元数据时 SF 才认为在放 HDR
+        // （与 HWC 是否支持 HDR 无关）。transact(21012) 就是 ColorOS 自己用的那条。
+        val hdr = sfLayerHasHdrMetadata()
+        if (hdr == true) return true
+        logEvery("sdrsafe", 5000L) {
+            "$TAG: fullscreen media without HDR content -> no boost (SDR safe, hdrLayer=" + hdr + ")"
+        }
+        return false
+    }
+
+    // ── G. HDR 内容证据：SurfaceFlinger 图层元数据 ──────────
+    //
+    // 实测：HDR10 片源播放时，SF 图层 dump 里会出现
+    //     hdr metadata types=3        （3 = SMPTE2086 | CTA861_3，HDR10 静态元数据）
+    // 而 SDR 片源全部是 types=0。这是与播放器实现无关、且不依赖 HWC 支持 HDR 的硬证据。
+    // （ColorOS 的 transact(21012) 不行：它要求真正进入 HDR 合成，本机 HWC 不支持，恒 0。）
+    //
+    // 成本控制：只在「全屏 + 媒体会话」成立时才查；结果缓存 2s；
+    // 用管道并发读取并**命中即停**，避免 237KB 全量解析和管道阻塞。
+    @Volatile private var hdrMetaCache: Boolean? = null
+    @Volatile private var hdrMetaAt = 0L
+
+    private fun sfLayerHasHdrMetadata(): Boolean? {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val cached = hdrMetaCache
+        if (cached != null && now - hdrMetaAt < 2000L) return cached
+        val v = querySfLayerHdr()
+        if (v != null) {
+            hdrMetaCache = v
+            hdrMetaAt = now
+        }
+        return v ?: cached
+    }
+
+    private fun querySfLayerHdr(): Boolean? = try {
+        val binder = Class.forName("android.os.ServiceManager")
+            .getMethod("getService", String::class.java)
+            .invoke(null, "SurfaceFlinger") as? android.os.IBinder ?: return null
+        val pipe = android.os.ParcelFileDescriptor.createPipe()
+        val readFd = pipe[0]
+        val writeFd = pipe[1]
+        val hit = java.util.concurrent.atomic.AtomicBoolean(false)
+        val reader = Thread {
+            try {
+                java.io.FileInputStream(readFd.fileDescriptor).bufferedReader().use { br ->
+                    while (true) {
+                        val line = br.readLine() ?: break
+                        val i = line.indexOf("hdr metadata types=")
+                        if (i >= 0) {
+                            val s = line.substring(i + 20).trim()
+                            var j = 0
+                            while (j < s.length && s[j].isDigit()) j++
+                            val n = s.substring(0, j).toIntOrNull() ?: 0
+                            if (n > 0) {
+                                hit.set(true)
+                                break // 命中即停，不等全量 dump
+                            }
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            } finally {
+                try {
+                    readFd.close()
+                } catch (_: Throwable) {
+                }
+            }
+        }.apply { isDaemon = true }
+        reader.start()
+        try {
+            binder.dump(writeFd.fileDescriptor, arrayOf())
+        } catch (_: Throwable) {
+            // 读端提前关闭会抛 EPIPE，属预期
+        } finally {
+            try {
+                writeFd.close()
+            } catch (_: Throwable) {
+            }
+        }
+        reader.join(1500L)
+        hit.get()
+    } catch (_: Throwable) {
+        null
+    }
+
+    /** 事件驱动：一旦有媒体会话/窗口变化，立刻重算一次，不等下一轮轮询 */
+    @Volatile private var recheckAt = 0L
+    private fun recheckNow() {
+        recheckAt = android.os.SystemClock.elapsedRealtime()
+        hdrMetaCache = null // 失效缓存，强制重查
     }
 
     /** 前台窗口是否全屏/沉浸（用于把"音乐 App 前台播放"排除掉） */
@@ -828,6 +924,7 @@ object HdrBoostHook {
                         val cm = XposedHelpers.callMethod(attrs, "getColorMode") as? Int ?: 0
                         if (cm == COLOR_MODE_HDR && vis == 0) hdrWindows.add(client)
                         else hdrWindows.remove(client)
+                        if (vis == 0) recheckNow()
                     } catch (_: Throwable) {
                     }
                 }
