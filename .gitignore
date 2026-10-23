@@ -1,0 +1,28 @@
+# 构建产物
+module/build/
+module/app/build/
+module/.gradle/
+module/.kotlin/
+*.apk
+*.jks
+!module/keystore/fkoscreen-debug.jks
+local.properties
+
+# 逆向中间产物（体积大，可重新生成）
+analysis/jars/
+analysis/hdrcap/
+analysis/lead/
+analysis/framework/out/
+analysis/framework/logs/
+analysis/oplus/jadx/
+analysis/oplus/logs/
+analysis/oplus/extract/
+analysis/lspd/
+analysis/*.png
+
+# 上游参考仓库（按需重新 clone）
+ref-FkOScreen/
+
+# 系统
+.DS_Store
+*.log
