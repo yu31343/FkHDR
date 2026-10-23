@@ -59,6 +59,10 @@ object HdrBoostHook {
         "com.android.server.display.feature.postprocess.OplusBrightnessPostProcessingManager"
     private const val CLS_LOCAL_DEVICE_EXT =
         "com.android.server.display.LocalDisplayDeviceExtImpl"
+    private const val CLS_FEATURE_MGR = "com.oplus.content.OplusFeatureConfigManager"
+    private const val CLS_FEATURE_CACHE = "com.oplus.content.OplusFeatureCache"
+    private const val CLS_FEATURE_MANAGER =
+        "com.android.server.display.feature.postprocess.OplusDisplayFeatureManager"
 
     /** 本机产品配置缺失、但 ColorOS 代码依赖的 feature */
     private val MISSING_FEATURES = setOf(
@@ -102,6 +106,8 @@ object HdrBoostHook {
     fun init(classLoader: ClassLoader) {
         val steps = StringBuilder()
         steps.append("features=").append(hookFeatures(classLoader))
+        steps.append(" featCfg=").append(hookFeatureSingleton(classLoader))
+        steps.append(" fmgr=").append(hookFeatureManager(classLoader))
         steps.append(" ratioFlag=").append(hookRatioSupport(classLoader))
         nativeDriver = if (prop(PROP_NATIVE, "1") != "0") hookOplusHdrEnhance(classLoader) else {
             XposedBridge.log("$TAG: native driver disabled by " + PROP_NATIVE + ", fallback only")
@@ -211,6 +217,77 @@ object HdrBoostHook {
         0
     }
 
+    // ── A3. C17：feature 查询改走本地缓存，必须在缓存层兜住 ────
+    //
+    // ColorOS 17 的 com.oplus.content.OplusFeatureConfigManager#hasFeature(String) 实现是
+    //     return this.mCache.query(name);     // 纯本地缓存，根本不经过 ConfigManagerService
+    // 于是老办法「hook OplusFeatureConfigManagerService.hasFeature」在 C17 上完全失效：
+    // OplusDisplayFeatureManager.mEnhanceHDRBrightnessSupport 恒 false ->
+    // ColorOS 自己那个 HDR 提亮驱动（OplusFeatureHDREnchanceBrightness）压根不会被 new 出来
+    // -> 日志里 driver=null -> 原生提亮链整条消失。
+    //
+    // 平台差异（C16 只有 Service 一条路，C17 两条路并存）：
+    //   OplusFeatureCache.getOrCreate(IOplusFeatureConfigManagerInternal.DEFAULT).hasFeature()  <- 仍能被 Service hook 影响
+    //   OplusFeatureConfigManager.getInstacne().hasFeature()                                  <- 只读本地缓存
+    // 两条都兜住才算通杀。
+    private fun hookFeatureSingleton(classLoader: ClassLoader): Int {
+        var n = 0
+        val hook = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                if (!enabled()) return
+                val name = param.args.getOrNull(0) as? String ?: return
+                if (name in MISSING_FEATURES) param.result = true
+            }
+        }
+        try {
+            val cls = XposedHelpers.findClass(CLS_FEATURE_MGR, classLoader)
+            n += hookAll(cls, "hasFeature", hook)
+        } catch (t: Throwable) {
+            logEvery("featmgr", 60000L) { "$TAG: feature singleton unavailable: " + t.message }
+        }
+        try {
+            val cls = XposedHelpers.findClass(CLS_FEATURE_CACHE, classLoader)
+            n += hookAll(cls, "query", hook)
+        } catch (t: Throwable) {
+            logEvery("featcache", 60000L) { "$TAG: feature cache unavailable: " + t.message }
+        }
+        return n
+    }
+
+    // ── A4. 双保险：直接掰开 feature manager 的开关 ───────────
+    //
+    // 就算将来 OPPO 再换 feature 查询实现，只要这个字段还是它，就在这里强制置位，
+    // 保证 constructOptionalEnhanceFeatures() 里那句
+    //     if (this.mEnhanceHDRBrightnessSupport) { this.mHDREnhanceBrightness = new ... }
+    // 一定会执行。
+    private fun hookFeatureManager(classLoader: ClassLoader): Int = try {
+        val cls = XposedHelpers.findClass(CLS_FEATURE_MANAGER, classLoader)
+        val hook = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                if (!enabled()) return
+                val self = param.thisObject
+                try {
+                    if (!XposedHelpers.getBooleanField(self, "mEnhanceHDRBrightnessSupport")) {
+                        XposedHelpers.setBooleanField(self, "mEnhanceHDRBrightnessSupport", true)
+                        XposedBridge.log("$TAG: forced mEnhanceHDRBrightnessSupport=true")
+                    }
+                } catch (t: Throwable) {
+                    logEvery("fmgrfail", 5000L) {
+                        "$TAG: force feature-manager flag failed: " + t.message
+                    }
+                }
+            }
+        }
+        // C16 用 addPostprocessFeatures()；C17 拆成 constructOptionalEnhanceFeatures()。
+        // 两个名字都挂，谁存在就谁生效。
+        var n = hookAll(cls, "addPostprocessFeatures", hook)
+        n += hookAll(cls, "constructOptionalEnhanceFeatures", hook)
+        n
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: OplusDisplayFeatureManager not found: " + t.message)
+        0
+    }
+
     // ── B. 首选：驱动 ColorOS 自己的 HDR 提亮实现 ────────────
     private fun hookOplusHdrEnhance(classLoader: ClassLoader): Boolean {
         return try {
@@ -232,6 +309,15 @@ object HdrBoostHook {
                     if (!hdrOn) return
                     try {
                         XposedHelpers.callMethod(builder, "setHasEdrProcessed")
+                    } catch (_: Throwable) {
+                    }
+                    // C17 新增了按包名取 mEnhanceFactor 的白名单逻辑，
+                    // 每次后处理前都重新压一遍，保证不受任何应用切换影响。
+                    val self = param.thisObject
+                    try {
+                        XposedHelpers.setBooleanField(self, "mEnterWhiteApp", true)
+                        XposedHelpers.setFloatField(self, "mEnhanceFactor", factor())
+                        XposedHelpers.setBooleanField(self, "mNeedToEnhanceBrightness", true)
                     } catch (_: Throwable) {
                     }
                     logEvery("pp", 2000L) {
