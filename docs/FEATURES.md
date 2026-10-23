@@ -11,6 +11,20 @@
 | 2 | 面板无 HDR colorMode + HWC 无 HDR 通路 | SF 不进 HDR 合成，`checkIsPlayingHDR()` 恒 0，HDR 信号缺失 | 自己造信号（窗口 colorMode / 媒体会话 + SF 图层元数据） |
 | 3 | `Builder.setNit()` 在 `mHasEdrProcessed==false` 时同步抬高 sdrNit | 面板亮了但 `hdrSdrRatio` 恒 1 | `setHasEdrProcessed()` 先置位，保住 SDR 白点 |
 
+## 一之二、平台分级（v1.9.0，严格互斥）
+
+启动时先判定平台，**只挂对应平台的 hook**，避免在其它系统上反复触发
+`ClassNotFoundException` 产生无意义错误日志。
+
+| 平台 | 判定依据 | 启用的 hook |
+|---|---|---|
+| `coloros` | 存在 `OplusFeatureConfigManagerService` | feature 注入、原生驱动、后处理兜底、白名单解除、DisplayInfo 伪装 |
+| `aosp` | 存在 `LocalDisplayAdapter` 但无 OPPO 类 | `ILocalDisplayDeviceExt#isSupportSdrToHdrRatio` 闸门 + `setDisplayBrightness` 峰值注入 |
+| `unknown` | 两者皆无 | 仅通用链路（DPC / WMS / 媒体会话 / HDR 内容检测） |
+
+通用链路（三类平台都挂，均为 AOSP 基础类）：
+`DisplayPowerController`、`WindowManagerService`、`MediaSessionStack`、HDR 内容检测、状态机。
+
 ## 二、实现分层
 
 ### A. feature 注入（两代 API 都覆盖）
@@ -39,7 +53,33 @@
 - 事件驱动：`MediaSessionStack.addSession` / `WMS.relayoutWindow` 触发即时重算
 - **不要求全屏**：半屏/分屏同样触发
 
-### E. 白名单彻底解除（C17 新增了按包名取倍率）
+### E. 类原生（AOSP）通路（v1.9.0）
+
+AOSP 的比率链与 ColorOS 同构（ColorOS 就是在 AOSP 上做 ExtImpl）：
+
+```
+LocalDisplayAdapter$LocalDisplayDevice$1#setDisplayBrightness(brightness, sdrBrightness)
+  ├─ nits    = backlightToNits(brightnessToBacklight(brightness))
+  ├─ sdrNits = backlightToNits(brightnessToBacklight(sdrBrightness))
+  └─ if (mLocalDisplayDeviceExt.isSupportSdrToHdrRatio() && nits!=0 && sdrNits!=0)
+         handleHdrSdrNitsChanged(nits, sdrNits)      ← 唯一比率计算点
+```
+
+类原生失效点：`ILocalDisplayDeviceExt#isSupportSdrToHdrRatio()` 默认 false → 比率永不计算。
+修复两步：
+1. **闸门**：捕获 `LocalDisplayDevice` 实例 → 取 `mLocalDisplayDeviceExt` 的**运行时类** →
+   hook `isSupportSdrToHdrRatio` 返回 true。不写死类名，通吃 AOSP 桩类 / OEM Impl。
+2. **造差值**：hook `setDisplayBrightness(float,float)`，HDR 内容时把 `args[0]` 抬到面板最大、
+   `args[1]` 保留用户亮度。**量纲自适应**：`args[0] > 1.5` 视为绝对量纲（ColorOS 0..2047），
+   否则视为 AOSP 归一化（0..1）。
+
+实测（C16 强制 AOSP 模式验证 hook 挂载）：
+```
+aosp[dev=1 bright=1]
+aosp ratio gate opened on com.android.server.display.LocalDisplayDeviceExtImpl (1 method)
+```
+
+### F. 白名单彻底解除（C17 新增了按包名取倍率）
 | 层 | 处理 |
 |---|---|
 | `getEnhanceFactorForPackage(pkg)` | hook 为对所有包返回我们的倍率 |

@@ -111,20 +111,62 @@ object HdrBoostHook {
         }
     }
 
-    fun init(classLoader: ClassLoader) {
-        val steps = StringBuilder()
-        steps.append("features=").append(hookFeatures(classLoader))
-        steps.append(" ratioMax=").append(hookSystemRatioMax(classLoader))
-        steps.append(" forge=").append(hookDisplayInfoForgery(classLoader))
-        steps.append(" featCfg=").append(hookFeatureSingleton(classLoader))
-        steps.append(" fmgr=").append(hookFeatureManager(classLoader))
-        steps.append(" ratioFlag=").append(hookRatioSupport(classLoader))
-        nativeDriver = if (prop(PROP_NATIVE, "1") != "0") hookOplusHdrEnhance(classLoader) else {
-            XposedBridge.log("$TAG: native driver disabled by " + PROP_NATIVE + ", fallback only")
-            false
+    /**
+     * 平台分级。严格互斥，不跨平台挂 hook：
+     *   COLOROS —— 有 OPPO 私有 ExtImpl/feature 体系（ColorOS / realme / OnePlus 官方 ROM）
+     *   AOSP    —— 纯 AOSP 显示栈（LineageOS / PE / GSI 等类原生）
+     *   UNKNOWN —— 只有通用链路（DPC / WMS / 媒体会话 / HDR 检测），不碰任何私有类
+     *
+     * 目的：避免在 AOSP 上反复触发 ClassNotFoundException 产生无意义错误日志。
+     */
+    private const val PLAT_COLOROS = "coloros"
+    private const val PLAT_AOSP = "aosp"
+    private const val PLAT_UNKNOWN = "unknown"
+
+    @Volatile private var platform = PLAT_UNKNOWN
+
+    private fun detectPlatform(cl: ClassLoader): String = try {
+        XposedHelpers.findClass("com.android.server.content.OplusFeatureConfigManagerService", cl)
+        PLAT_COLOROS
+    } catch (_: Throwable) {
+        try {
+            XposedHelpers.findClass("com.android.server.display.LocalDisplayAdapter", cl)
+            PLAT_AOSP
+        } catch (_: Throwable) {
+            PLAT_UNKNOWN
         }
-        steps.append(" native=").append(nativeDriver)
-        steps.append(" boost=").append(hookPostProcessBoost(classLoader))
+    }
+
+    fun init(classLoader: ClassLoader) {
+        platform = detectPlatform(classLoader)
+        val steps = StringBuilder("platform=").append(platform)
+
+        // ── 平台专属：ColorOS ──────────────────────────────
+        if (platform == PLAT_COLOROS) {
+            steps.append(" features=").append(hookFeatures(classLoader))
+            steps.append(" ratioMax=").append(hookSystemRatioMax(classLoader))
+            steps.append(" forge=").append(hookDisplayInfoForgery(classLoader))
+            steps.append(" featCfg=").append(hookFeatureSingleton(classLoader))
+            steps.append(" fmgr=").append(hookFeatureManager(classLoader))
+            steps.append(" ratioFlag=").append(hookRatioSupport(classLoader))
+            nativeDriver = if (prop(PROP_NATIVE, "1") != "0") {
+                hookOplusHdrEnhance(classLoader)
+            } else {
+                false
+            }
+            steps.append(" native=").append(nativeDriver)
+            steps.append(" boost=").append(hookPostProcessBoost(classLoader))
+        }
+
+        // ── 平台专属：AOSP ─────────────────────────────────
+        // 仅当 ColorOS 专属路径不可用、且确实是 AOSP 显示栈时才启用
+        val forceAosp = prop("persist.sys.fkoscreen.hdr_aosp_force", "0") == "1"
+        aospMode = platform == PLAT_AOSP || forceAosp
+        if (aospMode) {
+            steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
+        }
+
+        // ── 通用：三类平台都挂（都是 AOSP 基础类，必然存在）──
         steps.append(" dpc=").append(hookDisplayPowerController(classLoader))
         steps.append(" media=").append(hookMediaSessions(classLoader))
         steps.append(" wms=").append(hookWindowManager(classLoader))
@@ -745,6 +787,121 @@ object HdrBoostHook {
         } catch (t: Throwable) {
             logEvery("boostfail", 3000L) { "$TAG: boost failed: " + t }
             false
+        }
+    }
+
+    // ── H. 类原生（AOSP）通路 ───────────────────────────────
+    //
+    // AOSP 的比率链与 ColorOS 完全同构（ColorOS 就是在 AOSP 上做 ExtImpl）：
+    //   LocalDisplayAdapter$LocalDisplayDevice$1#setDisplayBrightness(float brightness, float sdrBrightness)
+    //     ├─ nits = backlightToNits(brightnessToBacklight(brightness))
+    //     ├─ sdrNits = backlightToNits(brightnessToBacklight(sdrBrightness))
+    //     ├─ mLocalDisplayDeviceExt.setDisplayBrightness(...)      ← OEM 钩子，AOSP 桩类空实现
+    //     └─ if (mLocalDisplayDeviceExt.isSupportSdrToHdrRatio() && nits!=0 && sdrNits!=0)
+    //             handleHdrSdrNitsChanged(nits, sdrNits)          ← 唯一的比率计算点
+    //
+    // 类原生上 isSupportSdrToHdrRatio() 默认 false → 比率永不计算 → App 看到恒 1.0。
+    // 所以类原生只需两步：
+    //   ① 把 isSupportSdrToHdrRatio() 掰成 true（打开比率计算）
+    //   ② 让 brightness != sdrBrightness（造出 HDR 峰值与 SDR 白点之差）
+    //
+    // ②的做法：把 brightness 抬到面板最大、sdrBrightness 保留用户亮度。
+    // AOSP 的 brightness 是归一化 0..1（BrightnessEvent 日志 brt=0.45882353），所以峰值取 1.0f。
+    // 仅在「OPPO 通路完全不可用」时启用，避免在 ColorOS 上误改 0..2047 量纲。
+    /** 内部类分隔符（避免 Kotlin 字符串模板把 $ 当插值） */
+    private const val D = "$"
+
+    @Volatile private var aospMode = false
+    @Volatile private var extHooked = false
+
+    private fun hookAospLocalDisplay(classLoader: ClassLoader): String {
+        // ① 捕获 LocalDisplayDevice 实例 → 拿到 mLocalDisplayDeviceExt 的运行时类 → 挂闸门
+        var dev = 0
+        try {
+            val cls = XposedHelpers.findClass(
+                "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice", classLoader
+            )
+            dev = hookAll(cls, "requestDisplayStateLocked", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    hookExt(param.thisObject)
+                }
+            })
+            if (dev == 0) {
+                // 退路：构造器
+                XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        hookExt(param.thisObject)
+                    }
+                })
+                dev = -1
+            }
+        } catch (t: Throwable) {
+            logEvery("aospdev", 60000L) { "$TAG: LocalDisplayDevice unavailable: " + t.message }
+        }
+
+        // ② 亮度注入点
+        var bright = 0
+        try {
+            val inner = XposedHelpers.findClass(
+                "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice" + D + "1", classLoader
+            )
+            bright = hookAll(inner, "setDisplayBrightness", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (!aospMode || !enabled() || !hdrOn) return
+                    val args = param.args
+                    if (args.size < 2) return
+                    val sdr = args[1] as? Float ?: return
+                    if (sdr.isNaN() || sdr <= 0f) return
+                    // HDR 峰值 → 面板最大。量纲自适应：
+                    //   AOSP 归一化 0..1（BrightnessEvent brt=0.45882353）→ peak=1.0
+                    //   ColorOS 绝对 0..2047（mScreenBrightnessRangeMaximum）→ peak=该值
+                    val cur = args[0] as? Float ?: return
+                    val peak = if (cur > 1.5f) absMaxBrightness() else 1.0f
+                    if (peak <= sdr) return
+                    args[0] = peak
+                    logEvery("aospboost", 2000L) {
+                        "$TAG: aosp boost brightness " + f2(sdr) + " -> " + f2(peak) +
+                            " (sdr kept " + f2(sdr) + ")"
+                    }
+                }
+            })
+        } catch (t: Throwable) {
+            logEvery("aospbright", 60000L) { "$TAG: setDisplayBrightness unavailable: " + t.message }
+        }
+        return "dev=" + dev + " bright=" + bright
+    }
+
+    /** 绝对量纲下的面板最大亮度（ColorOS 等非归一化实现） */
+    private fun absMaxBrightness(): Float {
+        val d = dpc ?: return 1.0f
+        for (f in arrayOf("mScreenBrightnessRangeMaximum", "mScreenBrightnessNormalMaximum")) {
+            try {
+                val v = XposedHelpers.getFloatField(d, f)
+                if (v > 1.5f) return v
+            } catch (_: Throwable) {
+            }
+        }
+        return 1.0f
+    }
+
+    /** 把运行时 Ext 类的 isSupportSdrToHdrRatio 掰成 true（不依赖具体类名，通吃 AOSP/ColorOS/OEM） */
+    private fun hookExt(devObj: Any?) {
+        if (extHooked || devObj == null) return
+        try {
+            val ext = XposedHelpers.getObjectField(devObj, "mLocalDisplayDeviceExt") ?: return
+            val extCls = ext.javaClass
+            val n = XposedBridge.hookAllMethods(extCls, "isSupportSdrToHdrRatio", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (enabled()) param.result = true
+                }
+            }).size
+            if (n > 0) {
+                extHooked = true
+                XposedBridge.log(
+                    "$TAG: aosp ratio gate opened on " + extCls.name + " (" + n + " method)"
+                )
+            }
+        } catch (_: Throwable) {
         }
     }
 
