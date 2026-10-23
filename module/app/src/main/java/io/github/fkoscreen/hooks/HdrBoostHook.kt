@@ -5,41 +5,53 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 
 /**
- * ColorOS HDR 修复（通用版：无白名单依赖，全应用生效，带降级分支）
+ * ColorOS HDR 提亮修复（通用版：无白名单，全应用生效，带自诊断与通用兜底）
  *
- * ── 本机根因 ────────────────────────────────────────────────
+ * ── 根因（ColorOS 16 实测 + 反编译确认）──────────────────────
  * 1) 产品配置缺 3 个 OPPO feature -> isSupportSdrToHdrRatio() 恒 false，
  *    HDR 提亮 feature 不进亮度后处理链，hdrSdrRatio 停在 NaN。
  * 2) 面板没有 HDR color mode -> SurfaceFlinger 不进 HDR 合成 ->
  *    ColorOS 的 checkIsPlayingHDR() 恒 0（HDR 开关信号缺失）。
- * 3) ColorOS 提亮只改面板 nit，Builder.setNit() 顺手把 sdrNit 也改成同值 ->
- *    面板亮了但 hdrSdrRatio 恒 1。
+ * 3) ColorOS 提亮只改面板 nit，Builder.setNit() 在 mHasEdrProcessed==false 时
+ *    顺手把 sdrNit 也改成同值 -> 面板亮了但 hdrSdrRatio 恒 1。
+ *
+ * ── 三层实现（任何一层单独可用，按可用性叠加）──────────────
+ * A. 原生驱动：接管 OplusFeatureHDREnhanceBrightness 的 mEnterWhiteApp / mEnhanceFactor，
+ *    由它自己算 nit、走自己的动画与硬件上限 clamp。并强制打开它的
+ *    mEnhanceHDRBrightnessSupport（新版系统该 feature 名可能查不到，会导致整条链静默失效）。
+ * B. 通用兜底：OplusBrightnessPostProcessingManager#convertNitToBrightness 之前，
+ *    若 hdrOn 且系统没有把 nit 抬上去（nit/sdrNit <= 1.02），直接按面板上限改 nit，
+ *    并先 setHasEdrProcessed() 保住 SDR 白点，让系统自己算出真实比率。
+ *    ——这一层不依赖任何 OPPO feature 类，改类名/改开关也照样生效。
+ * C. 比率开关：LocalDisplayDeviceExtImpl#isSupportSdrToHdrRatio() 恒 true，
+ *    让系统愿意上报 hdrSdrRatio。
  *
  * ── 关于「HDR 亮度比例」────────────────────────────────────
- * 不再使用任何写死的比率（旧实现的 1.5625 已删除）。比值完全由系统按**面板硬件上限**推导：
- *   ratio = 面板 nit(getMaxPanelNit()) / SDR 白点 nit
- * 所以亮度越低比值越大（低亮度余量多），亮度拉满时自然回落到 1.0；
- * HDR 关闭后 SDR 白点与面板重新相等，比值动画回落 1.0。
+ * 不使用任何写死的比率。ratio = 面板 nit / SDR 白点 nit，由面板硬件上限决定：
+ * 亮度越低比值越大，亮度拉满时自然回落到 1.0；HDR 关闭后回落 1.0。
  *
- * ── 设计原则 ────────────────────────────────────────────────
- * · 亮度算法不实现：优先驱动 ColorOS 自己的 OplusFeatureHDREnhanceBrightness
- *   （enterEnhanceBrightness / exitEnhanceBrightness，含它自己的动画与硬件上限 clamp）。
- * · 不走白名单：直接接管 mEnterWhiteApp，任何前台应用都能触发，与 <hdr_enhance_method> 表无关。
- * · 降级：找不到 ColorOS 的 HDR 提亮类时，退回 ColorOS 通用的 nit 后处理链
- *   （OplusBrightnessPostProcessingManager），仍然不碰面板驱动。
- * · 所有 hook 都 try/catch，类不存在就跳过，不会影响其它机型/版本。
+ * ── 诊断 ────────────────────────────────────────────────────
+ * 所有关键节点写 XposedBridge.log（LSPosed 管理器 → 日志 可见），前缀 FkOScreen:HdrFix。
+ * 不生效时日志能直接区分：「类没找到 / hook 没挂上 / feature 没开 /
+ * 系统没调 postProcessing / 提亮被上限截断」。
  *
  * 关闭：setprop persist.sys.fkoscreen.hdr_fix 0（重启生效）
+ * 倍数：setprop persist.sys.fkoscreen.hdr_factor 2.0（默认 100，由面板上限截断）
  */
 object HdrBoostHook {
     private const val TAG = "FkOScreen:HdrFix"
     private const val PROP_ENABLE = "persist.sys.fkoscreen.hdr_fix"
     private const val PROP_FACTOR = "persist.sys.fkoscreen.hdr_factor"
+    /** 1=启用原生驱动（默认），0=只用通用兜底（用于定位/兜底） */
+    private const val PROP_NATIVE = "persist.sys.fkoscreen.hdr_native"
 
     private const val COLOR_MODE_HDR = 2
     private const val CODE_GET_HDR_STATE = 21012
     private const val SF_TOKEN = "android.ui.ISurfaceComposer"
     private const val POLL_MS = 400L
+
+    /** 认为「系统自己已经提亮过」的阈值：nit / sdrNit */
+    private const val RATIO_DONE = 1.02f
 
     private const val CLS_HDR_ENHANCE =
         "com.android.server.display.feature.postprocess.OplusFeatureHDREnhanceBrightness"
@@ -60,18 +72,47 @@ object HdrBoostHook {
     @Volatile private var hdrOn = false
     @Volatile private var nativeDriver = false
 
+    /** 用来主动触发一次亮度重算（兜底路径没有别的触发器） */
+    @Volatile private var dpc: Any? = null
+    @Volatile private var dpcHandler: android.os.Handler? = null
+
+    /** 面板 nit 硬件上限，0 = 还没读到 */
+    @Volatile private var panelMaxNit = 0f
+
     /** 可见且 LayoutParams.colorMode == COLOR_MODE_HDR 的窗口（relayout 事件维护） */
     private val hdrWindows = java.util.Collections.synchronizedSet(
         java.util.Collections.newSetFromMap(java.util.WeakHashMap<Any, Boolean>())
     )
 
+    // ── 限流日志 ────────────────────────────────────────────
+    private val logAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun logEvery(key: String, ms: Long, msg: () -> String) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val last = logAt[key] ?: 0L
+        if (now - last < ms) return
+        logAt[key] = now
+        try {
+            val s = msg()
+            if (s.isNotEmpty()) XposedBridge.log(s)
+        } catch (_: Throwable) {
+        }
+    }
+
     fun init(classLoader: ClassLoader) {
-        hookFeatures(classLoader)
-        nativeDriver = hookOplusHdrEnhance(classLoader)
-        if (!nativeDriver) hookGenericBoost(classLoader)
-        hookWindowManager(classLoader)
+        val steps = StringBuilder()
+        steps.append("features=").append(hookFeatures(classLoader))
+        steps.append(" ratioFlag=").append(hookRatioSupport(classLoader))
+        nativeDriver = if (prop(PROP_NATIVE, "1") != "0") hookOplusHdrEnhance(classLoader) else {
+            XposedBridge.log("$TAG: native driver disabled by " + PROP_NATIVE + ", fallback only")
+            false
+        }
+        steps.append(" native=").append(nativeDriver)
+        steps.append(" boost=").append(hookPostProcessBoost(classLoader))
+        steps.append(" dpc=").append(hookDisplayPowerController(classLoader))
+        steps.append(" wms=").append(hookWindowManager(classLoader))
         startWatcher()
-        XposedBridge.log("$TAG: init done, nativeDriver=$nativeDriver")
+        XposedBridge.log("$TAG: init done [" + steps + "] factor=" + factor())
     }
 
     // ── 属性 ────────────────────────────────────────────────
@@ -83,39 +124,91 @@ object HdrBoostHook {
         def
     }
 
+    // enabled() 在 watcher 里每 400ms 调一次，加 5s 缓存避免反复 read syscall
+    @Volatile private var enabledCache = true
+    @Volatile private var enabledAt = 0L
+
     /** 开关优先级：系统属性 > 模块界面开关（复用原 hdr_ratio_fix 键） */
     private fun enabled(): Boolean {
-        val p = prop(PROP_ENABLE, "")
-        if (p.isNotEmpty()) return p != "0" && !p.equals("false", true)
-        return try {
-            io.github.fkoscreen.ConfigManager.isHdrFixEnabled()
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - enabledAt < 5000L) return enabledCache
+        val v = try {
+            val p = prop(PROP_ENABLE, "")
+            if (p.isNotEmpty()) p != "0" && !p.equals("false", true)
+            else io.github.fkoscreen.ConfigManager.isHdrFixEnabled()
         } catch (_: Throwable) {
             true
         }
+        enabledCache = v
+        enabledAt = now
+        return v
     }
 
-    /** 提亮倍数；默认 100 -> 由 ColorOS 自己 clamp 到 getMaxPanelNit() 硬件上限 */
+    /** 提亮倍数；默认 100 -> 由面板 nit 上限截断，等于「只受硬件限制」 */
     private fun factor() = prop(PROP_FACTOR, "100").toFloatOrNull()?.takeIf { it > 1f } ?: 100f
 
-    // ── A. 补 feature 配置（所有 ColorOS 通用） ──────────────
-    private fun hookFeatures(classLoader: ClassLoader) {
-        try {
-            val svc = XposedHelpers.findClass(
-                "com.android.server.content.OplusFeatureConfigManagerService", classLoader
-            )
-            val hook = object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!enabled()) return
-                    val name = param.args.getOrNull(0) as? String ?: return
-                    if (name in MISSING_FEATURES) param.result = true
-                }
+    private fun f2(v: Float): String = (Math.round(v * 100f) / 100f).toString()
+
+    // ── 工具：安全 hook + 安全读写字段 ───────────────────────
+    /** 返回该名字实际挂上多少个方法（0 = 这个版本里没有该方法） */
+    private fun hookAll(cls: Class<*>, name: String, hook: XC_MethodHook): Int = try {
+        XposedBridge.hookAllMethods(cls, name, hook).size
+    } catch (t: Throwable) {
+        logEvery("hook_" + name, 60000L) { "$TAG: hook " + name + " unavailable: " + t }
+        0
+    }
+
+    private fun boolField(o: Any, n: String): String = try {
+        XposedHelpers.getBooleanField(o, n).toString()
+    } catch (_: Throwable) {
+        "?"
+    }
+
+    private fun intField(o: Any, n: String): String = try {
+        XposedHelpers.getIntField(o, n).toString()
+    } catch (_: Throwable) {
+        "?"
+    }
+
+    private fun floatField(o: Any, n: String): String = try {
+        f2(XposedHelpers.getFloatField(o, n))
+    } catch (_: Throwable) {
+        "?"
+    }
+
+    private fun hasMethod(cls: Class<*>, name: String): Boolean =
+        cls.declaredMethods.any { it.name == name } ||
+            (cls.superclass?.declaredMethods?.any { it.name == name } ?: false)
+
+    // ── A1. 补 feature 配置 ─────────────────────────────────
+    private fun hookFeatures(classLoader: ClassLoader): Int = try {
+        val svc = XposedHelpers.findClass(
+            "com.android.server.content.OplusFeatureConfigManagerService", classLoader
+        )
+        val hook = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                if (!enabled()) return
+                val name = param.args.getOrNull(0) as? String ?: return
+                if (name in MISSING_FEATURES) param.result = true
             }
-            XposedBridge.hookAllMethods(svc, "hasFeature", hook)
-            XposedBridge.hookAllMethods(svc, "hasFeatureMap", hook)
-            XposedBridge.log("$TAG: hooked feature service")
-        } catch (t: Throwable) {
-            XposedBridge.log("$TAG: feature service not found: ${t.message}")
         }
+        hookAll(svc, "hasFeature", hook) + hookAll(svc, "hasFeatureMap", hook)
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: feature service not found: " + t.message)
+        0
+    }
+
+    // ── A2. 比率开关：让系统愿意算/上报 hdrSdrRatio ──────────
+    private fun hookRatioSupport(classLoader: ClassLoader): Int = try {
+        val ext = XposedHelpers.findClass(CLS_LOCAL_DEVICE_EXT, classLoader)
+        hookAll(ext, "isSupportSdrToHdrRatio", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                if (enabled()) param.result = true
+            }
+        })
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: LocalDisplayDeviceExtImpl not found: " + t.message)
+        0
     }
 
     // ── B. 首选：驱动 ColorOS 自己的 HDR 提亮实现 ────────────
@@ -124,85 +217,256 @@ object HdrBoostHook {
             val cls = XposedHelpers.findClass(CLS_HDR_ENHANCE, classLoader)
             XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    hdrEnhance = param.thisObject
+                    val self = param.thisObject
+                    hdrEnhance = self
+                    XposedBridge.log("$TAG: driver ready [" + hardenDriver(self) + "]")
                 }
             })
-            // 保住 SDR 白点：ColorOS 的 setNit() 会把 sdrNit 一起改掉，
-            // 先置 hasEdrProcessed 后，系统自己的 handleHdrSdrNitsChanged() 才能算出真实比率。
-            XposedBridge.hookAllMethods(cls, "postProcessing", object : XC_MethodHook() {
+
+            // 保住 SDR 白点：ColorOS 的 setNit() 在 mHasEdrProcessed==false 时会把
+            // sdrNit 一起改掉，先置 hasEdrProcessed 系统才能算出真实比率。
+            val nPost = hookAll(cls, "postProcessing", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!enabled() || !hdrOn) return
+                    if (!enabled()) return
                     val builder = param.args.getOrNull(0) ?: return
+                    if (!hdrOn) return
                     try {
                         XposedHelpers.callMethod(builder, "setHasEdrProcessed")
                     } catch (_: Throwable) {
                     }
+                    logEvery("pp", 2000L) {
+                        "$TAG: pp nit=" + num(builder, "getNit") +
+                            "/" + num(builder, "getSdrNit") +
+                            " [" + driverState(param.thisObject) + "]"
+                    }
                 }
             })
-            // 接管 HDR 状态：不走白名单，直接设 mEnterWhiteApp，然后走它自己的 enter/exit。
-            XposedBridge.hookAllMethods(cls, "checkIsPlayingHDR", object : XC_MethodHook() {
+
+            // 接管 HDR 状态：不走白名单，直接设 mEnterWhiteApp，再走它自己的 enter/exit。
+            val nCheck = hookAll(cls, "checkIsPlayingHDR", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     if (!enabled()) return
                     val self = param.thisObject
                     try {
                         XposedHelpers.setBooleanField(self, "mEnterWhiteApp", hdrOn)
                         XposedHelpers.setFloatField(self, "mEnhanceFactor", factor())
-                        if (hdrOn) XposedHelpers.callMethod(self, "enterEnhanceBrightness")
-                        else XposedHelpers.callMethod(self, "exitEnhanceBrightness")
-                    } catch (_: Throwable) {
+                        if (hdrOn) callPriv(self, "enterEnhanceBrightness")
+                        else callPriv(self, "exitEnhanceBrightness")
+                    } catch (t: Throwable) {
+                        logEvery("checkfail", 3000L) {
+                            "$TAG: force enter/exit failed: " + t
+                        }
                     }
                 }
             })
-            XposedBridge.log("$TAG: native driver hooked (OplusFeatureHDREnhanceBrightness)")
-            true
+
+            XposedBridge.log(
+                "$TAG: native driver hooked (post=" + nPost + " check=" + nCheck +
+                    " enter=" + hasMethod(cls, "enterEnhanceBrightness") +
+                    " exit=" + hasMethod(cls, "exitEnhanceBrightness") + ")"
+            )
+            nPost > 0 || nCheck > 0
         } catch (t: Throwable) {
-            XposedBridge.log("$TAG: native driver unavailable: ${t.message}")
+            XposedBridge.log("$TAG: native driver unavailable: " + t.message)
             false
         }
     }
 
-    // ── C. 降级：ColorOS 通用 nit 后处理链（其它版本/机型） ──
-    private fun hookGenericBoost(classLoader: ClassLoader) {
-        try {
-            val ext = XposedHelpers.findClass(CLS_LOCAL_DEVICE_EXT, classLoader)
-            XposedBridge.hookAllMethods(ext, "isSupportSdrToHdrRatio", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (enabled()) param.result = true
-                }
-            })
+    /**
+     * 兜住 ColorOS 自己的开关：新版系统上 OplusFeatureConfigManager 的查询链可能变了，
+     * mEnhanceHDRBrightnessSupport 会恒 false —— postProcessing 就整个静默失效。
+     * 这里直接掰成 true 并补跑 init()。
+     */
+    private fun hardenDriver(self: Any): String {
+        val sb = StringBuilder()
+        val support = try {
+            XposedHelpers.getBooleanField(self, "mEnhanceHDRBrightnessSupport")
         } catch (_: Throwable) {
+            true
+        }
+        sb.append("support=").append(support)
+        if (!support) {
+            try {
+                XposedHelpers.setBooleanField(self, "mEnhanceHDRBrightnessSupport", true)
+                sb.append("->true")
+                try {
+                    XposedHelpers.callMethod(self, "init")
+                    sb.append("(init ok)")
+                } catch (t: Throwable) {
+                    sb.append("(init fail:").append(t.javaClass.simpleName).append(")")
+                }
+            } catch (t: Throwable) {
+                sb.append("(force fail:").append(t.javaClass.simpleName).append(")")
+            }
+        }
+        sb.append(" maxNit=").append(floatField(self, "mMaxNit"))
+        sb.append(" factor=").append(floatField(self, "mEnhanceFactor"))
+        return sb.toString()
+    }
+
+    private fun callPriv(self: Any, name: String) {
+        try {
+            XposedHelpers.callMethod(self, name)
+        } catch (t: Throwable) {
+            logEvery("call_" + name, 3000L) { "$TAG: " + name + " failed: " + t }
+        }
+    }
+
+    private fun driverState(self: Any?): String {
+        if (self == null) return "driver=null"
+        return "need=" + boolField(self, "mNeedToEnhanceBrightness") +
+            " enter=" + boolField(self, "mEnterWhiteApp") +
+            " enhanced=" + boolField(self, "mIsEnhancedStatus") +
+            " playingHDR=" + intField(self, "mIsPlayingHDR") +
+            " battery=" + intField(self, "mBatteryLevel") +
+            " powerSave=" + boolField(self, "mPowerSavingMode") +
+            " maxNit=" + floatField(self, "mMaxNit")
+    }
+
+    // ── C. 通用兜底：后处理链里按面板上限抬 nit ──────────────
+    //
+    // 注入点（ColorOS 16 反编译确认）：
+    //   OplusBrightnessPostProcessingManager#postProcessing(builder, rate)
+    //     ├─ mDisplayFeatureManager.postProcessing(builder)   <- 所有 OPPO feature（含 HDR 提亮）
+    //     ├─ builder.setNit(mBrightnessModel.clampNit(...))   <- 已按面板上限截断
+    //     ├─ convertNitToBrightness(builder)                  <- ★ 在这里把 nit 换成 brightness
+    //     └─ ...
+    // 所以钩 convertNitToBrightness 之前改 nit：既在全部 feature 之后（不会被覆盖），
+    // 又在亮度换算之前（改完立刻生效），且与具体 feature 类名无关。
+    private fun hookPostProcessBoost(classLoader: ClassLoader): Int = try {
+        val mgr = XposedHelpers.findClass(CLS_POST_MANAGER, classLoader)
+        var n = hookAll(mgr, "convertNitToBrightness", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                if (!enabled() || !hdrOn) return
+                val builder = param.args.getOrNull(0) ?: return
+                boost(param.thisObject, builder)
+            }
+        })
+        // 诊断：证明「后处理链到底有没有在跑」。C17 静默失效最常见的原因就是它压根没被调用。
+        n += hookAll(mgr, "postProcessing", object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                if (!enabled() || !hdrOn) return
+                logEvery("mpp", 2000L) {
+                    val st = param.result
+                    "$TAG: mgr pp ran nit=" + num(st, "getNit") +
+                        " sdrNit=" + num(st, "getSdrNit") +
+                        " brightness=" + num(st, "getBrightness")
+                }
+            }
+        })
+        n
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: post-processing manager not found: " + t.message)
+        0
+    }
+
+    // ── E. 主动触发亮度重算 ─────────────────────────────────
+    //
+    // 兜底路径是「被动」的：只有当系统重算亮度时才会经过 convertNitToBrightness。
+    // 光切窗口 colorMode 不会必然触发一次重算，所以 HDR 开关后必须自己点一次火。
+    private fun hookDisplayPowerController(classLoader: ClassLoader): Boolean = try {
+        val cls = XposedHelpers.findClass("com.android.server.display.DisplayPowerController", classLoader)
+        XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val self = param.thisObject
+                dpc = self
+                try {
+                    dpcHandler = XposedHelpers.getObjectField(self, "mHandler") as? android.os.Handler
+                } catch (_: Throwable) {
+                }
+            }
+        })
+        true
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: DisplayPowerController not found: " + t.message)
+        false
+    }
+
+    /** 让 DisplayPowerController 在自己的 handler 线程上重算一次亮度 */
+    private fun requestPowerUpdate() {
+        val d = dpc
+        if (d == null) {
+            logEvery("nodpc", 5000L) { "$TAG: no DPC instance, cannot request power update" }
+            return
+        }
+        val run = Runnable {
+            try {
+                XposedHelpers.callMethod(d, "updatePowerState")
+            } catch (t: Throwable) {
+                logEvery("updfail", 5000L) { "$TAG: updatePowerState failed: " + t }
+            }
         }
         try {
-            val mgr = XposedHelpers.findClass(CLS_POST_MANAGER, classLoader)
-            XposedBridge.hookAllMethods(mgr, "convertNitToBrightness", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!enabled() || !hdrOn) return
-                    try {
-                        val builder = param.args.getOrNull(0) ?: return
-                        val bc = builder.javaClass
-                        val base = (bc.getMethod("getNit").invoke(builder) as? Float) ?: return
-                        if (base.isNaN() || base <= 0f) return
-                        val model = XposedHelpers.getObjectField(param.thisObject, "mBrightnessModel")
-                        val maxNit = XposedHelpers.callMethod(model, "getMaxPanelNit") as Float
-                        if (maxNit <= 0f) return
-                        val target = minOf(maxNit, base * factor())
-                        if (target <= base * 1.02f) return
-                        XposedHelpers.callMethod(builder, "setHasEdrProcessed")
-                        XposedHelpers.callMethod(builder, "setSdrNit", base)
-                        XposedHelpers.callMethod(builder, "setNit", target)
-                        XposedHelpers.callMethod(builder, "setReason", "FkOScreen:HdrBoost")
-                    } catch (_: Throwable) {
-                    }
-                }
-            })
-            XposedBridge.log("$TAG: generic nit boost hooked")
+            val h = dpcHandler
+            if (h != null) h.post(run) else run.run()
         } catch (t: Throwable) {
-            XposedBridge.log("$TAG: generic boost unavailable: ${t.message}")
+            logEvery("updfail2", 5000L) { "$TAG: post update failed: " + t }
+        }
+    }
+
+    private fun num(o: Any, getter: String): Float = try {
+        (XposedHelpers.callMethod(o, getter) as? Float) ?: Float.NaN
+    } catch (_: Throwable) {
+        Float.NaN
+    }
+
+    /** 面板 nit 硬件上限（带缓存） */
+    private fun maxPanelNit(mgr: Any): Float {
+        val cached = panelMaxNit
+        if (cached > 0f) return cached
+        var v = Float.NaN
+        try {
+            val model = XposedHelpers.getObjectField(mgr, "mBrightnessModel")
+            v = num(model, "getMaxPanelNit")
+            if (v.isNaN() || v <= 0f) v = num(model, "getTotalBrightness")
+        } catch (_: Throwable) {
+        }
+        if (!v.isNaN() && v > 0f) panelMaxNit = v
+        return v
+    }
+
+    private fun boost(mgr: Any, builder: Any): Boolean {
+        return try {
+            val base = num(builder, "getNit")
+            if (base.isNaN() || base <= 0f) return false
+            val sdr = num(builder, "getSdrNit")
+            if (!sdr.isNaN() && sdr > 0f && base / sdr > RATIO_DONE) {
+                // 系统自己已经提亮了（原生驱动路径），不重复叠加
+                return false
+            }
+            val maxNit = maxPanelNit(mgr)
+            if (maxNit.isNaN() || maxNit <= 0f) {
+                logEvery("nomax", 5000L) { "$TAG: panel max nit unknown, skip boost" }
+                return false
+            }
+            val target = minOf(maxNit, base * factor())
+            if (target <= base * RATIO_DONE) {
+                logEvery("noboost", 5000L) {
+                    "$TAG: already at panel max, skip (nit=" + f2(base) + " max=" + maxNit + ")"
+                }
+                return false
+            }
+            XposedHelpers.callMethod(builder, "setHasEdrProcessed")
+            XposedHelpers.callMethod(builder, "setSdrNit", base)
+            XposedHelpers.callMethod(builder, "setNit", target)
+            try {
+                XposedHelpers.callMethod(builder, "setReason", "FkOScreen:HdrFix")
+            } catch (_: Throwable) {
+            }
+            logEvery("boost", 1000L) {
+                "$TAG: boost nit " + f2(base) + " -> " + f2(target) +
+                    " (max=" + f2(maxNit) + " ratio=" + f2(target / base) + ")"
+            }
+            true
+        } catch (t: Throwable) {
+            logEvery("boostfail", 3000L) { "$TAG: boost failed: " + t }
+            false
         }
     }
 
     // ── D. HDR 信号：焦点窗口 / relayout / SurfaceFlinger ─────
-    private fun hookWindowManager(classLoader: ClassLoader) {
+    private fun hookWindowManager(classLoader: ClassLoader): Int {
+        var n = 0
         try {
             val cls = XposedHelpers.findClass("com.android.server.wm.WindowManagerService", classLoader)
             XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
@@ -210,7 +474,7 @@ object HdrBoostHook {
                     wms = param.thisObject
                 }
             })
-            XposedBridge.hookAllMethods(cls, "relayoutWindow", object : XC_MethodHook() {
+            n += hookAll(cls, "relayoutWindow", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     if (wms == null) wms = param.thisObject
                     try {
@@ -226,19 +490,16 @@ object HdrBoostHook {
                     }
                 }
             })
-            try {
-                XposedBridge.hookAllMethods(cls, "removeWindow", object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val client = param.args.getOrNull(1) ?: return
-                        hdrWindows.remove(client)
-                    }
-                })
-            } catch (_: Throwable) {
-            }
-            XposedBridge.log("$TAG: hooked WindowManagerService")
+            n += hookAll(cls, "removeWindow", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val client = param.args.getOrNull(1) ?: return
+                    hdrWindows.remove(client)
+                }
+            })
         } catch (t: Throwable) {
-            XposedBridge.log("$TAG: WMS not found: ${t.message}")
+            XposedBridge.log("$TAG: WMS not found: " + t.message)
         }
+        return n
     }
 
     /** 焦点窗口是否请求 HDR；null = 反射失败 */
@@ -250,7 +511,8 @@ object HdrBoostHook {
         val win = XposedHelpers.getObjectField(dc, "mCurrentFocus") ?: return false
         val attrs = XposedHelpers.getObjectField(win, "mAttrs")
         (XposedHelpers.callMethod(attrs, "getColorMode") as Int) == COLOR_MODE_HDR
-    } catch (_: Throwable) {
+    } catch (t: Throwable) {
+        logEvery("focusfail", 10000L) { "$TAG: focus poll failed: " + t }
         null
     }
 
@@ -284,13 +546,30 @@ object HdrBoostHook {
                     val want = focus ?: (hdrWindows.isNotEmpty() || sfHdrPlaying())
                     if (want != hdrOn) {
                         hdrOn = want
-                        hdrEnhance?.let {
-                            try {
-                                XposedHelpers.callMethod(it, "checkIsPlayingHDR")
-                            } catch (_: Throwable) {
+                        val d = hdrEnhance
+                        if (d != null) callPriv(d, "checkIsPlayingHDR")
+                        // 原生驱动会自己 sendUpdatePowerState；没有驱动时必须自己点火
+                        requestPowerUpdate()
+                        try {
+                            val h = dpcHandler
+                            if (h != null) h.postDelayed({ requestPowerUpdate() }, 700L)
+                        } catch (_: Throwable) {
+                        }
+                        XposedBridge.log(
+                            "$TAG: HDR -> " + want +
+                                (if (focus == null) "(fallback)" else "(focus=" + focus + ")") +
+                                " [" + driverState(d) + "]"
+                        )
+                    } else if (want) {
+                        // HDR 开着但驱动没进提亮态 -> 3s 报一次，便于定位
+                        logEvery("stuck", 3000L) {
+                            val st = driverState(hdrEnhance)
+                            if (st.contains("enhanced=false") || st.contains("need=false")) {
+                                "$TAG: HDR on but driver idle [" + st + "]"
+                            } else {
+                                ""
                             }
                         }
-                        XposedBridge.log("$TAG: HDR -> $want")
                     }
                 } catch (_: Throwable) {
                 }
