@@ -46,6 +46,9 @@ object HdrBoostHook {
     private const val PROP_NATIVE = "persist.sys.fkoscreen.hdr_native"
     /** 1=允许通用兜底（默认），0=只走 ColorOS 原生驱动（用于验证原生链路是否独立可用） */
     private const val PROP_FALLBACK = "persist.sys.fkoscreen.hdr_fallback"
+    /** 1=视频播放也算 HDR 场景（默认），0=只认窗口 colorMode */
+    private const val PROP_VIDEO = "persist.sys.fkoscreen.hdr_video"
+    private const val PLAYBACK_PLAYING = 3
 
     private const val COLOR_MODE_HDR = 2
     private const val CODE_GET_HDR_STATE = 21012
@@ -118,6 +121,7 @@ object HdrBoostHook {
         steps.append(" native=").append(nativeDriver)
         steps.append(" boost=").append(hookPostProcessBoost(classLoader))
         steps.append(" dpc=").append(hookDisplayPowerController(classLoader))
+        steps.append(" media=").append(hookMediaSessions(classLoader))
         steps.append(" wms=").append(hookWindowManager(classLoader))
         startWatcher()
         XposedBridge.log("$TAG: init done [" + steps + "] factor=" + factor())
@@ -590,6 +594,168 @@ object HdrBoostHook {
         }
     }
 
+    // ── F. 视频链路：媒体会话检测 ───────────────────────────
+    //
+    // 本机平台层没有 HDR 显示能力（SF supportedHdrTypes=INVALID、supportedColorModes 无 HDR），
+    // 播放器永远不会把窗口 colorMode 设成 COLOR_MODE_HDR，所以「只看窗口」的视频永远不生效。
+    // 这里补一条独立的视频信号：system_server 里的 MediaSessionStack 能拿到所有会话的
+    // 播放状态与包名；只要「前台应用正在播放媒体」就视为 HDR 场景，交给同一套提亮链。
+    private val playingPkgs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun videoEnabled(): Boolean = prop(PROP_VIDEO, "1") != "0"
+
+    private fun hookMediaSessions(classLoader: ClassLoader): Int = try {
+        val cls = XposedHelpers.findClass("com.android.server.media.MediaSessionStack", classLoader)
+        val hook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                if (!enabled() || !videoEnabled()) return
+                val rec = param.args.getOrNull(0) ?: return
+                noteSession(rec)
+            }
+        }
+        var n = hookAll(cls, "onPlaybackStateChanged", hook)
+        n += hookAll(cls, "addSession", hook)
+        n += hookAll(cls, "joinSession2Stack", object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                if (!enabled() || !videoEnabled()) return
+                noteSession(param.args.getOrNull(0) ?: return)
+            }
+        })
+        n
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: MediaSessionStack not found: " + t.message)
+        0
+    }
+
+    private fun noteSession(rec: Any) {
+        try {
+            val pkg = XposedHelpers.callMethod(rec, "getPackageName") as? String ?: return
+            var state = -1
+            try {
+                state = XposedHelpers.getIntField(rec, "mPlaybackState")
+            } catch (_: Throwable) {
+                try {
+                    val st = XposedHelpers.callMethod(rec, "getStateWithUpdatedPosition") ?: return
+                    state = XposedHelpers.callMethod(st, "getState") as? Int ?: -1
+                } catch (_: Throwable) {
+                    return
+                }
+            }
+            if (state == PLAYBACK_PLAYING) {
+                playingPkgs[pkg] = android.os.SystemClock.elapsedRealtime()
+            } else {
+                // 不是播放态：立刻清掉，而不是等超时
+                var st2 = state
+                if (st2 < 0) {
+                    try {
+                        val st = XposedHelpers.callMethod(rec, "getStateWithUpdatedPosition") ?: return
+                        st2 = XposedHelpers.callMethod(st, "getState") as? Int ?: -1
+                    } catch (_: Throwable) {
+                    }
+                }
+                if (st2 != PLAYBACK_PLAYING) playingPkgs.remove(pkg)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 更可靠的视频信号：AudioFlinger 上报的活跃播放配置里，
+     * 只要有 contentType == CONTENT_TYPE_MOVIE 的活跃播放，就认为在放视频。
+     * 这条与播放器实现无关（不依赖它更不更新 MediaSession），覆盖绝大多数播放器。
+     */
+    private fun videoPlayingViaAudio(): Boolean = try {
+        val ctx = sysContext() ?: return false
+        val am = ctx.getSystemService(android.content.Context.AUDIO_SERVICE) as? android.media.AudioManager
+            ?: return false
+        val list = am.activePlaybackConfigurations ?: return false
+        val focusPkg = focusedPackage()
+        for (c in list) {
+            val active = try {
+                XposedHelpers.callMethod(c, "isActive") as? Boolean ?: false
+            } catch (_: Throwable) {
+                false
+            }
+            if (!active) continue
+            val attrs = try {
+                XposedHelpers.callMethod(c, "getAudioAttributes")
+            } catch (_: Throwable) {
+                null
+            } ?: continue
+            val ct = try {
+                XposedHelpers.callMethod(attrs, "getContentType") as? Int ?: -1
+            } catch (_: Throwable) {
+                -1
+            }
+            val usage = try {
+                XposedHelpers.callMethod(attrs, "getUsage") as? Int ?: -1
+            } catch (_: Throwable) {
+                -1
+            }
+            if (ct == 3 /* CONTENT_TYPE_MOVIE */) return true
+            // 绝大多数播放器不设 contentType（实测系统视频播放器 = UNKNOWN），
+            // 退一步：只要「前台应用」正在放 USAGE_MEDIA 的音频，就按视频处理。
+            if (usage != 1 /* USAGE_MEDIA */) continue
+            if (focusPkg == null) continue
+            val uid = try {
+                XposedHelpers.callMethod(c, "getClientUid") as? Int ?: -1
+            } catch (_: Throwable) {
+                -1
+            }
+            if (uid <= 0) continue
+            val pkgs = try {
+                ctx.packageManager.getPackagesForUid(uid)
+            } catch (_: Throwable) {
+                null
+            }
+            if (pkgs != null && pkgs.contains(focusPkg)) return true
+        }
+        false
+    } catch (_: Throwable) {
+        false
+    }
+
+    /** system_server 里的 Context（从 WMS 拿，避免自造） */
+    private fun sysContext(): android.content.Context? = try {
+        val w = wms ?: return null
+        XposedHelpers.getObjectField(w, "mContext") as? android.content.Context
+    } catch (_: Throwable) {
+        try {
+            // 退路：ActivityThread 的系统 context
+            val at = Class.forName("android.app.ActivityThread")
+                .getMethod("currentActivityThread").invoke(null) ?: return null
+            XposedHelpers.callMethod(at, "getSystemContext") as? android.content.Context
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** 前台应用是否正在播放媒体（视频链路的主信号） */
+    private fun videoPlaying(): Boolean {
+        if (!videoEnabled()) return false
+        if (videoPlayingViaAudio()) return true
+        val now = android.os.SystemClock.elapsedRealtime()
+        val it = playingPkgs.entries.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            if (now - e.value > 30000L) it.remove()
+        }
+        if (playingPkgs.isEmpty()) return false
+        val pkg = focusedPackage() ?: return false
+        return playingPkgs.containsKey(pkg)
+    }
+
+    private fun focusedPackage(): String? = try {
+        val w = wms ?: return null
+        val root = XposedHelpers.getObjectField(w, "mRoot")
+        val dc = XposedHelpers.callMethod(root, "getTopFocusedDisplayContent")
+        val win = XposedHelpers.getObjectField(dc, "mCurrentFocus") ?: return null
+        val attrs = XposedHelpers.getObjectField(win, "mAttrs")
+        XposedHelpers.getObjectField(attrs, "packageName") as? String
+    } catch (_: Throwable) {
+        null
+    }
+
     // ── D. HDR 信号：焦点窗口 / relayout / SurfaceFlinger ─────
     private fun hookWindowManager(classLoader: ClassLoader): Int {
         var n = 0
@@ -667,9 +833,15 @@ object HdrBoostHook {
         Thread {
             while (true) {
                 try {
-                    // 焦点窗口是权威值；反射失败才退回 relayout 集合 / SF 播放态
+                    // 三条信号：① 焦点窗口 colorMode ② 视频播放中 ③ 兜底（relayout 集合 / SF）
                     val focus = focusedWindowHdr()
-                    val want = focus ?: (hdrWindows.isNotEmpty() || sfHdrPlaying())
+                    val video = videoPlaying()
+                    val want = when {
+                        focus == true -> true
+                        video -> true
+                        focus == null -> hdrWindows.isNotEmpty() || sfHdrPlaying()
+                        else -> false
+                    }
                     if (want != hdrOn) {
                         hdrOn = want
                         val d = hdrEnhance
@@ -681,10 +853,14 @@ object HdrBoostHook {
                             if (h != null) h.postDelayed({ requestPowerUpdate() }, 700L)
                         } catch (_: Throwable) {
                         }
+                        val why = when {
+                            focus == true -> "focus=true"
+                            video -> "video playing"
+                            focus == null -> "fallback"
+                            else -> "focus=false"
+                        }
                         XposedBridge.log(
-                            "$TAG: HDR -> " + want +
-                                (if (focus == null) "(fallback)" else "(focus=" + focus + ")") +
-                                " [" + driverState(d) + "]"
+                            "$TAG: HDR -> " + want + "(" + why + ") [" + driverState(d) + "]"
                         )
                     } else if (want) {
                         // HDR 开着但驱动没进提亮态 -> 3s 报一次，便于定位
