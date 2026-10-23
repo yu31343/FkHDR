@@ -1,0 +1,6 @@
+id=hdr_fix
+name=ColorOS HDR Fix (config)
+version=v1.0
+versionCode=1
+author=ColorOS-hdr-fix
+description=补齐本机缺失的 OPPO HDR 相关 feature（enhance_brightness_with_uidimming / hdr_enhance_brightness_support / dolby_enhance_v1_support），让 ColorOS 自己的 HDR 比率与提亮链路生效。
