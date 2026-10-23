@@ -44,6 +44,8 @@ object HdrBoostHook {
     private const val PROP_FACTOR = "persist.sys.fkoscreen.hdr_factor"
     /** 1=启用原生驱动（默认），0=只用通用兜底（用于定位/兜底） */
     private const val PROP_NATIVE = "persist.sys.fkoscreen.hdr_native"
+    /** 1=允许通用兜底（默认），0=只走 ColorOS 原生驱动（用于验证原生链路是否独立可用） */
+    private const val PROP_FALLBACK = "persist.sys.fkoscreen.hdr_fallback"
 
     private const val COLOR_MODE_HDR = 2
     private const val CODE_GET_HDR_STATE = 21012
@@ -328,6 +330,29 @@ object HdrBoostHook {
                 }
             })
 
+            // ── 白名单彻底解除（C17 新增了「按包名取倍率」）──
+            // C17 的 onAppEnter(pkg) 会 getEnhanceFactorForPackage(pkg)：
+            //   不在 display_brightness_app_list.xml 里 -> 返回 null -> 直接 return，不设 mEnterWhiteApp
+            // 这里让它对所有包都返回我们的倍率，白名单形同不存在。
+            val nFactor = hookAll(cls, "getEnhanceFactorForPackage", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (enabled()) param.result = factor()
+                }
+            })
+
+            // onAppExit 会无条件 mEnterWhiteApp=false + exitEnhanceBrightness()，
+            // HDR 期间任何一次应用切换都会把提亮掐掉 —— 直接短路掉。
+            val nExit = hookAll(cls, "onAppExit", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (enabled() && hdrOn) {
+                        param.result = null
+                        logEvery("onexit", 2000L) {
+                            "$TAG: suppressed onAppExit while HDR on (bypass whitelist)"
+                        }
+                    }
+                }
+            })
+
             // 接管 HDR 状态：不走白名单，直接设 mEnterWhiteApp，再走它自己的 enter/exit。
             val nCheck = hookAll(cls, "checkIsPlayingHDR", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
@@ -349,7 +374,8 @@ object HdrBoostHook {
             XposedBridge.log(
                 "$TAG: native driver hooked (post=" + nPost + " check=" + nCheck +
                     " enter=" + hasMethod(cls, "enterEnhanceBrightness") +
-                    " exit=" + hasMethod(cls, "exitEnhanceBrightness") + ")"
+                    " exit=" + hasMethod(cls, "exitEnhanceBrightness") +
+                    " factorHook=" + nFactor + " exitHook=" + nExit + ")"
             )
             nPost > 0 || nCheck > 0
         } catch (t: Throwable) {
@@ -511,14 +537,28 @@ object HdrBoostHook {
         return v
     }
 
+    /** 通用兜底是否允许。设 0 则只走 ColorOS 原生驱动（用于验证原生链路）。 */
+    private fun fallbackEnabled(): Boolean = prop(PROP_FALLBACK, "1") != "0"
+
     private fun boost(mgr: Any, builder: Any): Boolean {
         return try {
+            if (!fallbackEnabled()) {
+                logEvery("fb_off", 5000L) { "$TAG: fallback disabled by " + PROP_FALLBACK }
+                return false
+            }
             val base = num(builder, "getNit")
             if (base.isNaN() || base <= 0f) return false
             val sdr = num(builder, "getSdrNit")
             if (!sdr.isNaN() && sdr > 0f && base / sdr > RATIO_DONE) {
-                // 系统自己已经提亮了（原生驱动路径），不重复叠加
+                // 原生驱动已经提亮了，兜底保持静默（证明日志：fallback idle）
+                logEvery("fb_idle", 10000L) {
+                    "$TAG: fallback idle (native engaged, nit=" + f2(base) +
+                        " sdrNit=" + f2(sdr) + " ratio=" + f2(base / sdr) + ")"
+                }
                 return false
+            }
+            logEvery("fb_active", 5000L) {
+                "$TAG: fallback active (native did not engage, nit=" + f2(base) + ")"
             }
             val maxNit = maxPanelNit(mgr)
             if (maxNit.isNaN() || maxNit <= 0f) {
