@@ -793,6 +793,8 @@ object HdrBoostHook {
         return v ?: cached
     }
 
+    private val HDR_META_RE = Regex("hdr metadata types=([0-9]+)")
+
     private fun querySfLayerHdr(): Boolean? = try {
         val binder = Class.forName("android.os.ServiceManager")
             .getMethod("getService", String::class.java)
@@ -806,12 +808,9 @@ object HdrBoostHook {
                 java.io.FileInputStream(readFd.fileDescriptor).bufferedReader().use { br ->
                     while (true) {
                         val line = br.readLine() ?: break
-                        val i = line.indexOf("hdr metadata types=")
-                        if (i >= 0) {
-                            val s = line.substring(i + 20).trim()
-                            var j = 0
-                            while (j < s.length && s[j].isDigit()) j++
-                            val n = s.substring(0, j).toIntOrNull() ?: 0
+                        val m = HDR_META_RE.find(line)
+                        if (m != null) {
+                            val n = m.groupValues[1].toIntOrNull() ?: 0
                             if (n > 0) {
                                 hit.set(true)
                                 break // 命中即停，不等全量 dump

@@ -24,3 +24,6 @@ dependencyResolutionManagement {
 
 rootProject.name = "FkOScreen"
 include(":app")
+
+// 独立的 HDR 验证播放器（不参与模块功能，仅用于实验取证）
+include(":player")
