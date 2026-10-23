@@ -42,6 +42,8 @@ object HdrBoostHook {
     private const val TAG = "FkOScreen:HdrFix"
     private const val PROP_ENABLE = "persist.sys.fkoscreen.hdr_fix"
     private const val PROP_FACTOR = "persist.sys.fkoscreen.hdr_factor"
+    /** 比值上限：物理硬件能接受的最大 HDR/SDR 比值（默认 8.0 = ColorOS 自己 getHighestHdrSdrRatio 的声明值） */
+    private const val PROP_RATIO_MAX = "persist.sys.fkoscreen.hdr_ratio_max"
     /** 1=启用原生驱动（默认），0=只用通用兜底（用于定位/兜底） */
     private const val PROP_NATIVE = "persist.sys.fkoscreen.hdr_native"
     /** 1=允许通用兜底（默认），0=只走 ColorOS 原生驱动（用于验证原生链路是否独立可用） */
@@ -112,6 +114,7 @@ object HdrBoostHook {
     fun init(classLoader: ClassLoader) {
         val steps = StringBuilder()
         steps.append("features=").append(hookFeatures(classLoader))
+        steps.append(" ratioMax=").append(hookSystemRatioMax(classLoader))
         steps.append(" forge=").append(hookDisplayInfoForgery(classLoader))
         steps.append(" featCfg=").append(hookFeatureSingleton(classLoader))
         steps.append(" fmgr=").append(hookFeatureManager(classLoader))
@@ -160,6 +163,56 @@ object HdrBoostHook {
 
     /** 提亮倍数；默认 100 -> 由面板 nit 上限截断，等于「只受硬件限制」 */
     private fun factor() = prop(PROP_FACTOR, "100").toFloatOrNull()?.takeIf { it > 1f } ?: 100f
+
+    /**
+     * 物理比值上限。取值优先级：
+     *   ① 属性 persist.sys.fkoscreen.hdr_ratio_max（人工指定）
+     *   ② ColorOS 自己声明的 DisplayManagerServiceExtImpl#getHighestHdrSdrRatio()
+     *      —— 这是 OPPO 对该面板 HDR 能力的官方口径，不是我们拍脑袋的数
+     *   ③ 兜底 8.0
+     * 面板/HBM 峰值有限，比值超过硬件能力只能靠压暗 SDR 白点硬凑，观感反而更差。
+     */
+    @Volatile private var sysRatioMax = 0f
+    /** DisplayPowerController 里的 DisplayDeviceConfig（面板配置，含 HDR 曲线） */
+    @Volatile private var displayConfig: Any? = null
+    /** 面板是否声明了 sdrToHdrRatioSpline */
+    @Volatile private var hasRatioSpline = false
+    /** 最近一次按面板曲线算出的比值上限（供原生路径复用） */
+    @Volatile private var lastRatioCap = Float.MAX_VALUE
+
+    /**
+     * 该档位下"面板自己承认"的 HDR/SDR 比值上限。分级推导，不写死任何数字：
+     *   ① 属性 persist.sys.fkoscreen.hdr_ratio_max —— 人工覆盖
+     *   ② 面板配置曲线 DisplayDeviceConfig.hasSdrToHdrRatioSpline() + getHdrBrightnessFromSdr()
+     *      —— 厂商为这块屏写的 nits→ratio 曲线，换机型自动适配
+     *   ③ 面板物理峰值 getMaxPanelNit() / sdrNit —— 不设额外上限，交给硬件本身
+     */
+    private fun ratioCapAt(mgr: Any, sdrNit: Float): Float {
+        prop(PROP_RATIO_MAX, "").toFloatOrNull()?.takeIf { it > 1f }?.let { return it }
+        val cfg = displayConfig ?: return Float.MAX_VALUE
+        if (!hasRatioSpline || sdrNit <= 0f || sdrNit.isNaN()) return Float.MAX_VALUE
+        return try {
+            val model = XposedHelpers.getObjectField(mgr, "mBrightnessModel")
+            // nit -> brightness
+            val sdrB = XposedHelpers.callMethod(model, "getValueByCurve", "backlights", sdrNit) as? Float
+            if (sdrB == null || sdrB <= 0f) return Float.MAX_VALUE
+            // 面板曲线给出的 HDR brightness
+            val hdrB = XposedHelpers.callMethod(
+                cfg, "getHdrBrightnessFromSdr", sdrB, Float.MAX_VALUE
+            ) as? Float
+            if (hdrB == null || hdrB <= 0f) return Float.MAX_VALUE
+            // brightness -> nit，换算回 hdrSdrRatio 的同一量纲
+            val hdrNit = XposedHelpers.callMethod(model, "getValueByCurve", "nits", hdrB) as? Float
+                ?: return Float.MAX_VALUE
+            val r = hdrNit / sdrNit
+            if (r > 1f) r else Float.MAX_VALUE
+        } catch (_: Throwable) {
+            Float.MAX_VALUE
+        }
+    }
+
+    /** 原生路径用的倍率：受面板曲线上限约束 */
+    private fun nativeFactor(): Float = minOf(factor(), lastRatioCap)
 
     private fun f2(v: Float): String = (Math.round(v * 100f) / 100f).toString()
 
@@ -223,6 +276,39 @@ object HdrBoostHook {
     } catch (t: Throwable) {
         XposedBridge.log("$TAG: LocalDisplayDeviceExtImpl not found: " + t.message)
         0
+    }
+
+    // ── A0. 读取系统自己声明的最大 HDR/SDR 比值 ─────────────
+    // DisplayManagerServiceExtImpl#getHighestHdrSdrRatio() 是 OPPO 对"这个面板最多能到几倍"的官方答案。
+    // 用它当上限，比我们硬编码任何数字都更贴近"物理硬件可接受"。
+    private fun hookSystemRatioMax(classLoader: ClassLoader): Boolean = try {
+        val cls = XposedHelpers.findClass(
+            "com.android.server.display.DisplayManagerServiceExtImpl", classLoader
+        )
+        val n = hookAll(cls, "getHighestHdrSdrRatio", object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val v = (param.result as? Float) ?: return
+                if (v > 1f && v != sysRatioMax) {
+                    sysRatioMax = v
+                    XposedBridge.log("$TAG: system declared max hdr/sdr ratio = " + f2(v))
+                }
+            }
+        })
+        // 顺带主动问一次，避免等别人调用
+        try {
+            val inst = XposedHelpers.callStaticMethod(
+                cls, "getInstance"
+            )
+            if (inst != null) {
+                val v = XposedHelpers.callMethod(inst, "getHighestHdrSdrRatio") as? Float
+                if (v != null && v > 1f) sysRatioMax = v
+            }
+        } catch (_: Throwable) {
+        }
+        n > 0
+    } catch (t: Throwable) {
+        logEvery("ratioMaxCls", 60000L) { "$TAG: getHighestHdrSdrRatio unavailable: " + t.message }
+        false
     }
 
     // ── A0. 全局伪装"HDR 可用" ───────────────────────────────
@@ -375,13 +461,14 @@ object HdrBoostHook {
                     val self = param.thisObject
                     try {
                         XposedHelpers.setBooleanField(self, "mEnterWhiteApp", true)
-                        XposedHelpers.setFloatField(self, "mEnhanceFactor", factor())
+                        XposedHelpers.setFloatField(self, "mEnhanceFactor", nativeFactor())
                         XposedHelpers.setBooleanField(self, "mNeedToEnhanceBrightness", true)
                     } catch (_: Throwable) {
                     }
                     logEvery("pp", 2000L) {
                         "$TAG: pp nit=" + num(builder, "getNit") +
                             "/" + num(builder, "getSdrNit") +
+                            " cap=" + (if (lastRatioCap >= 1e6f) "none(physical)" else f2(lastRatioCap)) +
                             " [" + driverState(param.thisObject) + "]"
                     }
                 }
@@ -417,7 +504,7 @@ object HdrBoostHook {
                     val self = param.thisObject
                     try {
                         XposedHelpers.setBooleanField(self, "mEnterWhiteApp", hdrOn)
-                        XposedHelpers.setFloatField(self, "mEnhanceFactor", factor())
+                        XposedHelpers.setFloatField(self, "mEnhanceFactor", nativeFactor())
                         if (hdrOn) callPriv(self, "enterEnhanceBrightness")
                         else callPriv(self, "exitEnhanceBrightness")
                     } catch (t: Throwable) {
@@ -543,6 +630,18 @@ object HdrBoostHook {
                     dpcHandler = XposedHelpers.getObjectField(self, "mHandler") as? android.os.Handler
                 } catch (_: Throwable) {
                 }
+                try {
+                    val cfg = XposedHelpers.getObjectField(self, "mDisplayDeviceConfig")
+                    displayConfig = cfg
+                    hasRatioSpline = XposedHelpers.callMethod(
+                        cfg, "hasSdrToHdrRatioSpline"
+                    ) as? Boolean ?: false
+                    XposedBridge.log(
+                        "$TAG: panel config ready [sdrToHdrSpline=" + hasRatioSpline + "]"
+                    )
+                } catch (t: Throwable) {
+                    logEvery("cfg", 60000L) { "$TAG: display config unavailable: " + t.message }
+                }
             }
         })
         true
@@ -622,7 +721,9 @@ object HdrBoostHook {
                 logEvery("nomax", 5000L) { "$TAG: panel max nit unknown, skip boost" }
                 return false
             }
-            val target = minOf(maxNit, base * factor())
+            val cap = ratioCapAt(mgr, base)
+            lastRatioCap = cap
+            val target = minOf(maxNit, base * factor(), base * cap)
             if (target <= base * RATIO_DONE) {
                 logEvery("noboost", 5000L) {
                     "$TAG: already at panel max, skip (nit=" + f2(base) + " max=" + maxNit + ")"
