@@ -13,8 +13,8 @@ android {
         applicationId = "io.github.benbaobaoshigemi.fkoscreen"
         minSdk = 26
         targetSdk = 34
-        versionCode = 16
-        versionName = "1.9.0"
+        versionCode = 17
+        versionName = "1.9.1"
     }
 
     signingConfigs {

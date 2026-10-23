@@ -155,13 +155,19 @@ object HdrBoostHook {
                 false
             }
             steps.append(" native=").append(nativeDriver)
-            steps.append(" boost=").append(hookPostProcessBoost(classLoader))
+            val boostN = hookPostProcessBoost(classLoader)
+            steps.append(" boost=").append(boostN)
+            // ColorOS 上 OPPO 通路全部失配时（未来版本改类名等），退回 AOSP 通路兜底
+            if (!nativeDriver && boostN == 0) {
+                oppoPathDead = true
+                XposedBridge.log("$TAG: OPPO path all missing on coloros -> enable AOSP fallback")
+            }
         }
 
         // ── 平台专属：AOSP ─────────────────────────────────
         // 仅当 ColorOS 专属路径不可用、且确实是 AOSP 显示栈时才启用
         val forceAosp = prop("persist.sys.fkoscreen.hdr_aosp_force", "0") == "1"
-        aospMode = platform == PLAT_AOSP || forceAosp
+        aospMode = platform == PLAT_AOSP || forceAosp || oppoPathDead
         if (aospMode) {
             steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
         }
@@ -812,6 +818,8 @@ object HdrBoostHook {
     private const val D = "$"
 
     @Volatile private var aospMode = false
+    /** ColorOS 上 OPPO 通路全部失配（原生驱动 + 后处理都挂不上） */
+    @Volatile private var oppoPathDead = false
     @Volatile private var extHooked = false
 
     private fun hookAospLocalDisplay(classLoader: ClassLoader): String {
