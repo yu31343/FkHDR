@@ -81,6 +81,24 @@ mSupportVideoAssist = false
 | `mEnhanceFactor` | 构造器 `=1.0f` | HDREnh 仍 0.0f；VideoAssist **默认 0.0f**（坑） |
 | 亮度动画日志 tag | `DpcExtImpl` | `AnimationProvider[display=0][Primary][AnimationScreenBrightness]` |
 
+### 4. 比率链路本体没坏，但客户端通知机制变了（重要）
+
+| 项 | C16 | C17 |
+|---|---|---|
+| `handleHdrSdrNitsChanged` | 唯一计算点 | **仍在、逐行等价、仍是唯一计算点** |
+| 公式 | `max(1.0, nits/sdrNits)` | **完全未变**，无新增上限 |
+| `isSupportSdrToHdrRatio()` | 只看 `enhance_brightness_with_uidimming` | 改成 `mSupportEdrWithUiDimming \|\| mSupportEdrNoUiDimming`（多一条 dolby OR） |
+| `sdrBrightness` | 直接用 | 先 `min(sdrBrightnessState, brightnessState)` 钳一次 |
+| `DisplayManagerService#handleLogicalDisplayHdrSdrRatioChangedLocked` | 存在 | **已删除**，并入 `getSendDisplayEventMaskLocked` |
+| display 事件常量 | 序号制，HDR=5，内部位=16 | **位掩码制**，HDR=**64**，内部位=**128**（全量重编号） |
+| 客户端收事件 | `registerDisplayListener` 默认能收 | **必须额外注册内部位 128**，否则收不到 |
+
+也就是说：**C17 上系统侧的比率是对的，但普通 `registerDisplayListener` 收不到 "比率变化" 事件了**。
+第三方检测 App（如 HDR能力检测 V0.7）若只注册默认过滤器、且不在 `onDisplayChanged` 里重读，
+就会一直显示旧值 `1.00000` —— 看起来像"没修好"，其实系统里已经变了。
+正确读法：`Display#registerHdrSdrRatioChangedListener`（内部以 0x88=136=128|8 注册），
+或在 **HDR 开着的时候** 直接看 `dumpsys display` 里的 `hdrSdrRatio`。
+
 ## 三、修复（v1.3.0）
 
 1. **补 feature 的两条路都兜住**
