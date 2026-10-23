@@ -38,7 +38,7 @@
 | 配置 | hook `OplusFeatureConfigManagerService.hasFeature/hasFeatureMap`，补 3 个 feature |
 | 白名单 | **不使用白名单**：直接接管 `mEnterWhiteApp`，任何前台应用都可触发 |
 | 提亮 | 驱动 ColorOS 自己的 `enterEnhanceBrightness()/exitEnhanceBrightness()`（倍数、clamp 到 `getMaxPanelNit()`、亮度动画全部是它的代码） |
-| 比率 | 提亮前 `setHasEdrProcessed()` 保住 SDR 白点，系统自己算出真实 `hdrSdrRatio` |
+| 比率 | 不写死任何比值：提亮前 `setHasEdrProcessed()` 保住 SDR 白点，系统按**面板硬件上限**推导 `ratio = getMaxPanelNit() / SDR 白点 nit` |
 | 信号 | 焦点窗口 `LayoutParams.colorMode` / relayout 事件 / SF transact 21012 三路取或 |
 | 降级 | 找不到 `OplusFeatureHDREnhanceBrightness` 时回退到 ColorOS 通用 nit 后处理链 |
 

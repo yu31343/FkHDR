@@ -17,7 +17,7 @@
 | 1 | 产品配置缺 3 个 OPPO feature（`enhance_brightness_with_uidimming` / `hdr_enhance_brightness_support` / `dolby_enhance_v1_support`）→ `isSupportSdrToHdrRatio()` 恒 false、HDR 提亮 feature 不入链 | hook `OplusFeatureConfigManagerService.hasFeature/hasFeatureMap` 返回 true |
 | 2 | `display_brightness_app_list.xml` 里整张 `<hdr_enhance_method>` 白名单表缺失 → 所有应用都拿不到提亮 | hook `existInHdrAppList()` 恒 true（全应用适用） |
 | 3 | 面板无 HDR color mode → SF 不进 HDR 合成 → `checkIsPlayingHDR()` 恒 0 | 三路信号取或：relayout 事件里的 `colorMode==COLOR_MODE_HDR` / 焦点窗口 `LayoutParams.colorMode` / SF transact 21012 |
-| 4 | ColorOS 提亮只改面板 nit，`Builder.setNit()` 顺手把 sdrNit 改成同值 → 面板亮了但比率恒 1 | 提亮前 `setHasEdrProcessed()`，保住 SDR 白点，面板/SDR 分离 |
+| 4 | ColorOS 提亮只改面板 nit，`Builder.setNit()` 顺手把 sdrNit 改成同值 → 面板亮了但比率恒 1 | 提亮前 `setHasEdrProcessed()`，保住 SDR 白点，面板/SDR 分离；比值由系统按**面板硬件上限**推导（不设软件封顶），HDR 关时回落 1.0 |
 | 5 | 退出时系统侧无信号 → 亮度不回落 | 信号消失即调 ColorOS 自己的 `exitEnhanceBrightness()`，由 DPC 动画回落 |
 
 ## 模块构成（`HdrBoostHook.kt`，约 250 行）
