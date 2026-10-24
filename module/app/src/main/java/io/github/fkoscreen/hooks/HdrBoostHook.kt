@@ -1122,11 +1122,19 @@ object HdrBoostHook {
      *
      * 注意：OPPO 的 isSupportSdrToHdrRatio() 是另一套（仅 ColorOS 存在），两者都要挂。
      */
+    /** 闸门开放窗口：HDR 关闭后再保留 5s，用于让回落那一次也把比值算回 1.0 */
+    @Volatile private var gateUntil = 0L
+
     private fun hookAospRatioGate(classLoader: ClassLoader): Int = try {
         val cls = XposedHelpers.findClass("com.android.server.display.DisplayDeviceConfig", classLoader)
         val n = XposedBridge.hookAllMethods(cls, "hasSdrToHdrRatioSpline", object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
-                param.result = true
+                if (!enabled()) return
+                // 只在 HDR 期间放行。常开会让「比值算不出（NaN）」的机型每次亮度变化都触发
+                // updateDeviceInfoLocked（floatEquals(NaN,NaN) 恒 false），白烧性能。
+                if (hdrOn || android.os.SystemClock.elapsedRealtime() < gateUntil) {
+                    param.result = true
+                }
             }
         }).size
         if (n > 0) {
@@ -1533,6 +1541,7 @@ object HdrBoostHook {
                     }
                     if (want != hdrOn) {
                         hdrOn = want
+                        if (!want) gateUntil = android.os.SystemClock.elapsedRealtime() + 5000L
                         val d = hdrEnhance
                         if (d != null) callPriv(d, "checkIsPlayingHDR")
                         // 原生驱动会自己 sendUpdatePowerState；没有驱动时必须自己点火
