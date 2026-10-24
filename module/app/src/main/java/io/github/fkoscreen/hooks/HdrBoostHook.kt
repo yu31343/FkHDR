@@ -145,7 +145,6 @@ object HdrBoostHook {
         if (platform == PLAT_COLOROS) {
             steps.append(" features=").append(hookFeatures(classLoader))
             steps.append(" ratioMax=").append(hookSystemRatioMax(classLoader))
-            steps.append(" forge=").append(hookDisplayInfoForgery(classLoader))
             steps.append(" featCfg=").append(hookFeatureSingleton(classLoader))
             steps.append(" fmgr=").append(hookFeatureManager(classLoader))
             steps.append(" ratioFlag=").append(hookRatioSupport(classLoader))
@@ -175,6 +174,9 @@ object HdrBoostHook {
         }
 
         // ── 通用：三类平台都挂（都是 AOSP 基础类，必然存在）──
+        // DisplayInfo 伪装也放通用段：patchDisplayInfo 自带守卫（已含 11/12 就原样返回），
+        // 真 HDR 机型不会被改动；缺 HDR 色彩模式的机型（本机）才会被补上。
+        steps.append(" forge=").append(hookDisplayInfoForgery(classLoader))
         steps.append(" dpc=").append(hookDisplayPowerController(classLoader))
         steps.append(" media=").append(hookMediaSessions(classLoader))
         steps.append(" wms=").append(hookWindowManager(classLoader))
@@ -893,6 +895,11 @@ object HdrBoostHook {
                             " (sdr kept " + f2(sdr) + ")"
                     }
                 }
+
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    // 兜底：不依赖 hasSdrToHdrRatioSpline() 闸门（实测被 ART 内联，hook 不生效）
+                    pushRatioDirect(param.thisObject, param.args)
+                }
             })
         } catch (t: Throwable) {
             logEvery("aospbright", 60000L) { "$TAG: setDisplayBrightness unavailable: " + t.message }
@@ -1107,6 +1114,70 @@ object HdrBoostHook {
             extHooked = true
             XposedBridge.log("$TAG: aosp ratio gate failed: " + t)
         }
+    }
+
+    // ── AOSP 比值：绕开闸门直接算 ───────────────────────────
+    //
+    // AOSP 的 setDisplayBrightness 末尾是：
+    //     if (getDisplayDeviceConfig().hasSdrToHdrRatioSpline()) handleHdrSdrNitsChanged(nits, sdrNits);
+    // 实测（LineageOS 23 / v1.9.2）：hook 了 hasSdrToHdrRatioSpline 并返回 true，但
+    // handleHdrSdrNitsChanged 依然一次都没被调用 —— 说明这个调用点被 ART 内联成常量 false，
+    // 挂在被调方上不生效。因此改为「自己算、自己调」：
+    //     brightnessToBacklight(b) → backlightToNits(backlight) → handleHdrSdrNitsChanged(nits, sdrNits)
+    // 这三个都是 $1 上的方法（私有/包私有），反射可调；不依赖任何面板配置声明。
+    @Volatile private var ratioB2B: java.lang.reflect.Method? = null
+    @Volatile private var ratioB2N: java.lang.reflect.Method? = null
+    @Volatile private var ratioApply: java.lang.reflect.Method? = null
+    @Volatile private var ratioResolved = false
+
+    private fun pushRatioDirect(inner: Any, args: Array<Any?>) {
+        if (!aospMode || !enabled()) return
+        // HDR 期间必算；HDR 结束后 5s 内也算一次，把比值收回 1.0
+        if (!hdrOn && android.os.SystemClock.elapsedRealtime() >= gateUntil) return
+        try {
+            if (!ratioResolved) {
+                val cls = inner.javaClass
+                ratioB2B = cls.declaredMethods.firstOrNull { it.name == "brightnessToBacklight" }
+                    ?.also { it.isAccessible = true }
+                ratioB2N = cls.declaredMethods.firstOrNull { it.name == "backlightToNits" }
+                    ?.also { it.isAccessible = true }
+                ratioApply = cls.declaredMethods.firstOrNull { it.name == "handleHdrSdrNitsChanged" }
+                    ?.also { it.isAccessible = true }
+                ratioResolved = true
+                XposedBridge.log(
+                    "$TAG: ratio direct ready (brightnessToBacklight=" + (ratioB2B != null) +
+                        " backlightToNits=" + (ratioB2N != null) +
+                        " handleHdrSdrNitsChanged=" + (ratioApply != null) + ")"
+                )
+            }
+            val b2b = ratioB2B
+            val b2n = ratioB2N
+            val apply = ratioApply
+            if (b2b == null || b2n == null || apply == null) return
+            val b = args.getOrNull(0) as? Float ?: return
+            val sdr = args.getOrNull(1) as? Float ?: return
+            if (b.isNaN() || sdr.isNaN()) return
+            val backlight = b2b.invoke(inner, b) as? Float ?: return
+            val sdrBacklight = b2b.invoke(inner, sdr) as? Float ?: return
+            val nits = b2n.invoke(inner, backlight) as? Float ?: return
+            val sdrNits = b2n.invoke(inner, sdrBacklight) as? Float ?: return
+            apply.invoke(inner, nits, sdrNits)
+            logEvery("ratio2", 2000L) {
+                "$TAG: ratio direct nits=" + f2(nits) + " sdrNits=" + f2(sdrNits) +
+                    " -> ratio=" + f2(if (sdrNits > 0f) nits / sdrNits else Float.NaN) +
+                    " current=" + f2(currentHdrSdrRatio(inner))
+            }
+        } catch (t: Throwable) {
+            logEvery("ratiofail", 10000L) { "$TAG: ratio direct failed: " + t }
+        }
+    }
+
+    /** 读回 LocalDisplayDevice.mCurrentHdrSdrRatio（App 最终看到的值） */
+    private fun currentHdrSdrRatio(inner: Any): Float = try {
+        val outer = XposedHelpers.getObjectField(inner, "this" + D + "0")
+        XposedHelpers.getFloatField(outer, "mCurrentHdrSdrRatio")
+    } catch (_: Throwable) {
+        Float.NaN
     }
 
     /**

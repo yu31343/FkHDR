@@ -211,3 +211,88 @@ FkOScreen:HdrFix: aosp push applied brightness=0.39 sdr=0.39 state=2
 |---|---|
 | v1.9.1 及以前 | **完全无效**：注入点永不触发 + 闸门指向 OPPO 私有符号（不存在），两条都静默失败 |
 | v1.9.2 | 注入点改到漏斗口 + 主动点火 + AOSP 正确闸门 + 全链路诊断日志 |
+
+---
+
+# 第二轮：v1.9.2 回验日志（`LSPosed_20261024_222107.zip`，2026-10-24 22:20）
+
+## 9. 这一轮证实了什么
+
+**注入链已经打通了。** 面板驱动自己的背光日志是决定性证据：
+
+```
+<CSOT-NT36532> dsi_display_set_backlight ... 14:20:40.300:2047, 14:20:41.898:21 ...
+```
+
+背光 **21 → 2047 → 21**，即「HDR 一出现面板真的被推到物理最大」。模块侧对应：
+
+```
+22:20:40.286 HDR -> true(focus=true) [driver=null]
+22:20:40.286 aosp push brightness 0.01 -> 1.0 (sdr kept 0.01)
+22:20:40.287 aosp boost brightness 0.01 -> 1.0 (sdr kept 0.01)
+22:20:40.291 aosp push applied brightness=1.0 sdr=0.01 state=2
+22:20:41.890 HDR -> false(focus=false) [driver=null]
+22:20:41.893 aosp push applied brightness=0.01 sdr=0.01 state=2
+```
+
+同时 `init done [... gate=1 probe=1 ...]`、`aosp funnel alive (... useSurfaceControlBrightness=true)` 都出现了。
+
+## 10. 但还有一环没通：比值仍然是 NaN
+
+整份日志里 **`ratio probe` 一次都没出现**。含义很明确：
+
+- `hasSdrToHdrRatioSpline` 的 hook 装了（`gate=1`），但
+- `handleHdrSdrNitsChanged` **从未被调用**（`probe=1` 却零触发）
+
+结论：**调用点 `if (getDisplayDeviceConfig().hasSdrToHdrRatioSpline()) handleHdrSdrNitsChanged(...)`
+被 ART 内联成了常量 false**，挂在被调方（`hasSdrToHdrRatioSpline`）上的 hook 不生效。
+这类「被调方内联」是 Xposed 的经典坑：hook 一个返回常量的小方法，调用方早已把它 inline 掉。
+
+后果：`mCurrentHdrSdrRatio` 恒为初始值 NaN → `DisplayInfo.hdrSdrRatio` 仍是 NaN →
+验收 App（`com.lns103.hdrCapability`）依旧不通过 → 用户看到「问题依旧」。
+
+## 11. v1.9.3 的修法：不靠闸门，自己算自己调
+
+在 `$1.setDisplayBrightness` 的 **after** 钩子里直接完成整条计算（三个方法都在 `$1` 上，反射可调）：
+
+```
+backlight    = brightnessToBacklight(brightnessState)
+sdrBacklight = brightnessToBacklight(sdrBrightnessState)
+nits         = backlightToNits(backlight)
+sdrNits      = backlightToNits(sdrBacklight)
+handleHdrSdrNitsChanged(nits, sdrNits)          ← 直接调用，绕过内联掉的闸门
+```
+
+- HDR 期间：`nits ≠ sdrNits` → 比值 = `nits/sdrNits`（真实物理比值）
+- HDR 结束：回落推送 `(sdr, sdr)` → `nits == sdrNits` → 比值自然回 1.0
+- 首次解析会打 `ratio direct ready (brightnessToBacklight=.. backlightToNits=.. handleHdrSdrNitsChanged=..)`
+- 每次计算打 `ratio direct nits=.. sdrNits=.. -> ratio=.. current=..`，`current` 就是 App 最终读到的值
+
+## 12. 第二个补强：DisplayInfo 伪装改为全平台
+
+v1.9.1/v1.9.2 只对 ColorOS 做 `supportedColorModes` 补 10/11/12，类原生没做。
+这就是为什么类原生上应用**无法把窗口 colorMode 设成 HDR**，只能被动等它自己设。
+v1.9.3 把 `hookDisplayInfoForgery` 移到通用段：`patchDisplayInfo` 自带守卫
+（已含 11/12 就原样返回），真 HDR 机型不会被改动。
+
+## 13. 第三轮日志判读表（v1.9.3）
+
+| 日志现象 | 判定 |
+|---|---|
+| 有 `ratio direct ready (brightnessToBacklight=false ...)` | 该 ROM 的 `$1` 方法名不同，需按实际类反编译适配 |
+| 有 `aosp push applied` 但无 `ratio direct nits=` | 反射调用被拒（`ratio direct failed` 会给出异常） |
+| `ratio direct nits=.. sdrNits=.. -> ratio=N current=M` 且 **M > 1** | ✅ 比值已真实上报 |
+| `ratio=N` 但 `current=NaN` | `handleHdrSdrNitsChanged` 内部判了 NaN：看 `useSurfaceControlBrightness` 是否为 false |
+| 有 `forged DisplayInfo HDR colorModes ...` | 应用现在能看到 HDR 色彩模式，可主动请求 COLOR_MODE_HDR |
+| 面板背光日志出现 `:2047` | 物理提亮已生效（`dmesg | grep dsi_display_set_backlight`） |
+
+---
+
+## 14. 三轮结论汇总
+
+| 版本 | 类原生表现 | 断在哪 |
+|---|---|---|
+| v1.9.1 及以前 | 完全无效 | 注入点永不触发 + 闸门指向 OPPO 私有符号 |
+| v1.9.2 | **物理提亮成功**（背光 21→2047），比值仍 NaN | 闸门 hook 被 ART 内联，`handleHdrSdrNitsChanged` 不执行 |
+| v1.9.3 | 比值改为自算自调 + 全平台 DisplayInfo 伪装 | 待回验 |
+
