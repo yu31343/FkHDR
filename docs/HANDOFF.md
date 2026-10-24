@@ -10,7 +10,9 @@
 FkOScreen HDR 修复模块在 **ColorOS 16 上图片与视频 HDR 链路全部实测通过**（v1.9.1）。
 类原生（LineageOS 23，同硬件）反馈"无效"，已用其 LSPosed 日志闭环定位：
 **v1.9.1 的 AOSP 通路有两处静默失效**（注入点永不触发 + 闸门指向 OPPO 私有符号），
-v1.9.2 已修，并补了全链路诊断日志。详见 `docs/lineage-aosp-no-effect.md`。
+v1.9.2 修好注入链（**实测面板背光 21→2047→21，物理提亮已生效**），但比值仍 NaN
+（闸门 hook 被 ART 内联）。v1.9.3 改为「自算自调 `handleHdrSdrNitsChanged`」并补
+`DisplayInfo` 伪装 + 退出迟滞。全过程见 `docs/lineage-aosp-no-effect.md`。
 
 ---
 
