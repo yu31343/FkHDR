@@ -1,14 +1,16 @@
 # 会话交接文档（HANDOFF）
 
-> 最后更新：v1.9.0 / 2026-10-23
+> 最后更新：v1.9.2 / 2026-10-24
 > 目的：下次会话 5 分钟内进入状态，不必重新逆向。
 
 ---
 
 ## 0. 一句话现状
 
-FkOScreen HDR 修复模块已在本机（ColorOS 16）**图片与视频 HDR 链路全部实测通过**；
-新增**平台分级**与**类原生 AOSP 通路**，AOSP 侧尚未在真机验证（缺类原生设备接入）。
+FkOScreen HDR 修复模块在 **ColorOS 16 上图片与视频 HDR 链路全部实测通过**（v1.9.1）。
+类原生（LineageOS 23，同硬件）反馈"无效"，已用其 LSPosed 日志闭环定位：
+**v1.9.1 的 AOSP 通路有两处静默失效**（注入点永不触发 + 闸门指向 OPPO 私有符号），
+v1.9.2 已修，并补了全链路诊断日志。详见 `docs/lineage-aosp-no-effect.md`。
 
 ---
 
@@ -129,12 +131,40 @@ rateType），AOSP 注入是"生硬改值"，两者同时跑会互相覆盖。�
 | 3 | `Builder.setNit()` 在 `mHasEdrProcessed==false` 时同步抬高 sdrNit → 比率恒 1 | 先 `setHasEdrProcessed()` 保住 SDR 白点 |
 | 4 | **C17**：feature 查询改走本地缓存 `OplusFeatureConfigManager#hasFeature → mCache.query()`，不再经过 Service | hook `OplusFeatureConfigManager`/`OplusFeatureCache` + 构造前强制 `mEnhanceHDRBrightnessSupport=true` |
 
-### 4.2 类原生（AOSP）
+### 4.2 类原生（AOSP）— v1.9.2 重写
 
-| # | 根因 | 解法 |
+> **旧结论已作废**：`mLocalDisplayDeviceExt` / `ILocalDisplayDeviceExt#isSupportSdrToHdrRatio()`
+> 是 **OPPO 私有**（oplus-services + ExtLoader）。纯 AOSP 16 **根本没有这两个符号**，
+> 所以 v1.9.1 的类原生通路是「hook 一个不存在的字段 → 静默空转」。
+> 已用 android16-release 源码逐行核实（LocalDisplayAdapter.java blob 2cad7ed2e9e9）。
+
+| # | 根因（实测确认） | 解法（v1.9.2） |
 |---|---|---|
-| 1 | `ILocalDisplayDeviceExt#isSupportSdrToHdrRatio()` 默认 false → `handleHdrSdrNitsChanged` 永不调用 | 运行时类 hook 返回 true |
-| 2 | brightness == sdrBrightness → 比率为 1 | `setDisplayBrightness` 注入峰值 |
+| 1 | AOSP 闸门是 `DisplayDeviceConfig#hasSdrToHdrRatioSpline()`；本机无 spline → 返回 false → `handleHdrSdrNitsChanged` 永不调用 → 比值恒为初始 NaN | hook `DisplayDeviceConfig#hasSdrToHdrRatioSpline` → true（HDR 关时 brightness==sdr，比值自然回 1.0） |
+| 2 | **被动注入永远等不到点火**：`requestDisplayStateLocked` 只在「状态或亮度真变化」时才被调用（`DisplayPowerState.setScreenBrightness` 用 `!=` 挡住无变化），而 HDR 起播不产生亮度变化 | HDR 翻转时主动反射调一次 `requestDisplayStateLocked(state, peak, sdr, null)` 并执行返回的 Runnable，造出「变化」 |
+| 3 | brightness == sdrBrightness → 比值 1 | 改写 `args[1] = 1.0`（面板物理最大 = HBM 区），保留 `args[2] = 用户亮度` |
+| 4 | 旧 `hookExt` 失败时 catch 后静默 return，日志上看不出任何异常 | 找不到字段/方法都明确打日志；新增 `ratio probe` 证明 `handleHdrSdrNitsChanged` 是否真的在跑 |
+
+**AOSP 侧的完整链路（v1.9.2 打通）**：
+
+```
+HDR 内容出现
+  └─ watcher 判定 hdrOn=true
+      ├─ pushAospBrightness(true)
+      │    └─ 反射 requestDisplayStateLocked(state=ON, 1.0, 用户亮度, null)
+      │         ├─ brightnessChanged = (mBrightnessState != 1.0) = true → 返回 Runnable
+      │         └─ Runnable.run() → setDisplayBrightness(1.0, 用户亮度)
+      │              ├─ backlight → 面板最大（物理变亮）
+      │              ├─ nits / sdrNits 分开上报给 SurfaceFlinger（HDR 有真实 headroom）
+      │              └─ hasSdrToHdrRatioSpline()（已 hook 成 true）→ handleHdrSdrNitsChanged
+      │                   └─ ratio = max(1, nits/sdrNits) → mInfo.hdrSdrRatio → App 可读
+      └─ HDR 结束 → pushAospBrightness(false) → setDisplayBrightness(用户亮度, 用户亮度) → 比值回 1.0
+```
+
+**注意 `mUseSurfaceControlBrightness`**：`handleHdrSdrNitsChanged` 内部还要求
+`mBacklightAdapter.mUseSurfaceControlBrightness || mForceSurfaceControl` 为 true，否则 ratio 直接置 NaN
+（只剩物理提亮）。该值来自 `SurfaceControl.getDisplayBrightnessSupport(token)`。
+v1.9.2 在 `aosp funnel alive` 日志里把它打出来，一眼可判。
 
 ### 4.3 AOSP 原生 HDR 提亮 API（已查清，尚未接通）
 
@@ -247,6 +277,7 @@ module/app/src/main/java/io/github/fkoscreen/
 module/player/                     # ★ 验证播放器（勿删）
 docs/
 ├── HANDOFF.md                     # ★ 本文档
+├── lineage-aosp-no-effect.md      # ★ 类原生"无效"日志闭环 + v1.9.2 修复 + 判读表
 ├── FEATURES.md                    # 功能总览 + 实测矩阵
 ├── c17-root-cause.md              # C17 根因
 ├── root-cause-framework.md        # AOSP 框架层逆向
@@ -264,7 +295,7 @@ analysis/
 
 | 优先级 | 事项 | 说明 |
 |---|---|---|
-| **高** | 类原生真机验证 | v1.9.0 的 AOSP 通路只在本机"强制模式"验证了 hook 挂载，**未在真 AOSP 系统验证效果** |
+| **高** | 类原生 v1.9.2 回验 | 让类原生用户装 v1.9.2，按 `docs/lineage-aosp-no-effect.md` §7 的判读表对照日志（看 `aosp push applied` / `ratio probe`） |
 | **高** | C17 实机复验 | 需确认日志出现 `forced mEnhanceHDRBrightnessSupport=true` 与 `driver ready` |
 | 中 | AOSP 原生 API 接通 | 若目标机型有 `sdr-to-hdr-ratio-spline`，可改走 `HighBrightnessModeController` 正规通路 |
 | 中 | 上游 PR | `contrib/` 里的补丁是旧版，需按当前代码重新生成 |
@@ -275,7 +306,8 @@ analysis/
 1. 类原生设备接 adb，确认 `adb devices` 可见
 2. 装 `FkOScreen_HDRFix_v1.9.0_release.apk`，LSPosed 作用域勾 **系统框架**
 3. 重启
-4. 看日志：`grep HdrFix` → 应出现 `platform=aosp` 与 `aosp[dev=.. bright=..]`、`aosp ratio gate opened on <类名>`
+4. 看日志：`grep HdrFix` → 应出现 `platform=aosp`、`aosp[dev=.. bright=..]`、`gate=1 probe=1`、
+   `aosp ratio gate opened on DisplayDeviceConfig.hasSdrToHdrRatioSpline`、`aosp funnel alive (... useSurfaceControlBrightness=..)`
 5. 推测试片源 + 装 `module/player`，播 HDR10，看 `hdrSdrRatio` 是否 > 1、亮度是否上升
 6. 播 SDR，确认不动
 7. 若失败：抓 `dumpsys display`（看 `supportedColorModes`、`hdrSdrRatio`）+ 模块日志 + `dumpsys SurfaceFlinger | grep 'hdr metadata'`

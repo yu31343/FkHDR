@@ -170,6 +170,8 @@ object HdrBoostHook {
         aospMode = platform == PLAT_AOSP || forceAosp || oppoPathDead
         if (aospMode) {
             steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
+            steps.append(" gate=").append(hookAospRatioGate(classLoader))
+            steps.append(" probe=").append(hookHdrRatioProbe(classLoader))
         }
 
         // ── 通用：三类平台都挂（都是 AOSP 基础类，必然存在）──
@@ -822,15 +824,33 @@ object HdrBoostHook {
     @Volatile private var oppoPathDead = false
     @Volatile private var extHooked = false
 
+    // ── AOSP 主动推送所需的设备快照 ────────────────────────
+    // requestDisplayStateLocked 只在「屏幕状态或亮度发生变化」时才会被调用（DisplayPowerState
+    // 内部用 floatEquals 挡住无变化调用），而 HDR 起播本身不产生亮度变化 —— 所以被动注入
+    // 永远等不到点火。这里缓存设备对象/状态/用户 SDR 亮度，HDR 翻转时主动推一次。
+    @Volatile private var aospDev: Any? = null
+    @Volatile private var aospState: Int = -1
+    @Volatile private var aospSdr: Float = Float.NaN
+    @Volatile private var aospPeak: Float = 1.0f
+    /** 已经证明漏斗在跑（避免每次启动都刷日志） */
+    @Volatile private var aospFunnelSeen = false
+
     private fun hookAospLocalDisplay(classLoader: ClassLoader): String {
         // ① 捕获 LocalDisplayDevice 实例 → 拿到 mLocalDisplayDeviceExt 的运行时类 → 挂闸门
+        //    同时在这一层改写 brightnessState：这是「面板亮度」进入设备的唯一漏斗，
+        //    且它上游 DisplayPowerState 只在亮度真变化时才调它 —— 见 ② 的主动推送。
         var dev = 0
         try {
             val cls = XposedHelpers.findClass(
                 "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice", classLoader
             )
             dev = hookAll(cls, "requestDisplayStateLocked", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    onAospRequestState(param)
+                }
+
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    aospDev = param.thisObject
                     hookExt(param.thisObject)
                 }
             })
@@ -838,6 +858,7 @@ object HdrBoostHook {
                 // 退路：构造器
                 XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        aospDev = param.thisObject
                         hookExt(param.thisObject)
                     }
                 })
@@ -879,6 +900,144 @@ object HdrBoostHook {
         return "dev=" + dev + " bright=" + bright
     }
 
+    /**
+     * requestDisplayStateLocked 的入参改写点。
+     *
+     * 形参：(int state, float brightnessState, float sdrBrightnessState[, DisplayOffloadSession])
+     *   brightnessState    → 面板背光（AOSP 归一化 0..1，1.0 = 面板物理最大 = HBM 区）
+     *   sdrBrightnessState → SDR 白点（保留用户当前亮度，不动）
+     *
+     * 把前者抬到 1.0、后者保留用户值 → 面板变亮且 SDR 内容不变，
+     * 比值 = nits(1.0)/nits(用户) 才有意义。
+     */
+    private fun onAospRequestState(param: XC_MethodHook.MethodHookParam) {
+        val a = param.args
+        if (a.size < 3) return
+        val st = a[0] as? Int ?: return
+        val b = a[1] as? Float ?: return
+        val sdr = a[2] as? Float ?: return
+
+        aospDev = param.thisObject
+        aospState = st
+        if (sdr.isFinite() && sdr > 0.001f) aospSdr = sdr
+
+        if (!aospFunnelSeen) {
+            aospFunnelSeen = true
+            // useSurfaceControlBrightness 决定 AOSP 会不会算比值：false 时 handleHdrSdrNitsChanged
+            // 会把 ratio 直接置 NaN（只剩物理提亮）。这条日志能一眼判定类原生上到底有没有比值能力。
+            var sc = "?"
+            try {
+                val ba = XposedHelpers.getObjectField(param.thisObject, "mBacklightAdapter")
+                sc = XposedHelpers.getBooleanField(ba, "mUseSurfaceControlBrightness").toString()
+            } catch (_: Throwable) {
+            }
+            XposedBridge.log(
+                "$TAG: aosp funnel alive (state=" + st + " brightness=" + f2(b) +
+                    " sdr=" + f2(sdr) + " useSurfaceControlBrightness=" + sc + ")"
+            )
+        }
+        if (!aospMode || !enabled() || !hdrOn) return
+
+        val sdrEff = if (sdr.isFinite() && sdr > 0.001f) sdr else b
+        val peak = if (b > 1.5f) absMaxBrightness() else 1.0f
+        aospPeak = peak
+        if (peak > sdrEff) {
+            a[1] = peak
+            logEvery("aosppush", 2000L) {
+                "$TAG: aosp push brightness " + f2(sdrEff) + " -> " + f2(peak) +
+                    " (sdr kept " + f2(sdrEff) + ")"
+            }
+        }
+    }
+
+    /**
+     * HDR 翻转时主动推一次亮度。
+     *
+     * 为什么必须主动推：DisplayPowerState 只在值真变化时才 scheduleScreenUpdate，
+     * 而 HDR 起播不改亮度 → requestDisplayStateLocked 根本不会被调用 → 被动 hook 永不触发。
+     * 这里直接反射调一次 requestDisplayStateLocked 造出「变化」，让系统自己走完整链路
+     * （内部会同时更新 mBrightnessState，所以退出 HDR 时能自然回落到用户亮度）。
+     */
+    private fun pushAospBrightness(boost: Boolean) {
+        if (!aospMode) return
+        val dev = aospDev
+        if (dev == null) {
+            logEvery("aospnodev", 5000L) {
+                "$TAG: aosp push skipped: LocalDisplayDevice not captured yet"
+            }
+            return
+        }
+        val sdr = aospSdr
+        if (!sdr.isFinite() || sdr <= 0.001f) {
+            logEvery("aospnosdr", 5000L) {
+                "$TAG: aosp push skipped: no user sdr brightness yet"
+            }
+            return
+        }
+        val target = if (boost) {
+            if (absMaxBrightness() > 1.5f) absMaxBrightness() else 1.0f
+        } else {
+            sdr
+        }
+        // 状态必须取设备自己的 mState：随便传一个值会让 runnable 误以为要切换电源状态，
+        // 在 DOZE/AOD 下可能把屏幕直接点亮。
+        var st = aospState
+        try {
+            st = XposedHelpers.getIntField(dev, "mState")
+        } catch (_: Throwable) {
+        }
+        if (st != 2) {
+            // 2 = Display.STATE_ON。非亮屏态不推亮度，交给之后的被动改写
+            logEvery("aospstate", 5000L) {
+                "$TAG: aosp push skipped: display not ON (state=" + st + ")"
+            }
+            return
+        }
+        val task = Runnable {
+            try {
+                val m = dev.javaClass.declaredMethods.firstOrNull {
+                    it.name == "requestDisplayStateLocked" &&
+                        it.parameterTypes.size >= 3 &&
+                        it.parameterTypes[0] == Integer.TYPE &&
+                        it.parameterTypes[1] == java.lang.Float.TYPE &&
+                        it.parameterTypes[2] == java.lang.Float.TYPE
+                }
+                if (m == null) {
+                    logEvery("aosprdsl", 5000L) {
+                        "$TAG: aosp push failed: requestDisplayStateLocked signature not found"
+                    }
+                    return@Runnable
+                }
+                m.isAccessible = true
+                val callArgs = arrayOfNulls<Any?>(m.parameterTypes.size)
+                callArgs[0] = st
+                callArgs[1] = target
+                callArgs[2] = sdr
+                val runnable = m.invoke(dev, *callArgs) as? Runnable
+                if (runnable == null) {
+                    // 没有产生 Runnable = 系统认为没变化，说明上一次已经推到位
+                    logEvery("aospnoop", 5000L) {
+                        "$TAG: aosp push no-op (already " + f2(target) + ")"
+                    }
+                    return@Runnable
+                }
+                runnable.run()
+                logEvery("aosppushok", 1000L) {
+                    "$TAG: aosp push applied brightness=" + f2(target) +
+                        " sdr=" + f2(sdr) + " state=" + st
+                }
+            } catch (t: Throwable) {
+                logEvery("aosppushfail", 3000L) { "$TAG: aosp push failed: " + t }
+            }
+        }
+        try {
+            val h = dpcHandler
+            if (h != null) h.post(task) else task.run()
+        } catch (_: Throwable) {
+            task.run()
+        }
+    }
+
     /** 绝对量纲下的面板最大亮度（ColorOS 等非归一化实现） */
     private fun absMaxBrightness(): Float {
         val d = dpc ?: return 1.0f
@@ -892,25 +1051,143 @@ object HdrBoostHook {
         return 1.0f
     }
 
-    /** 把运行时 Ext 类的 isSupportSdrToHdrRatio 掰成 true（不依赖具体类名，通吃 AOSP/ColorOS/OEM） */
+    /**
+     * 把运行时 Ext 类的 isSupportSdrToHdrRatio 掰成 true（不依赖具体类名，通吃 AOSP/ColorOS/OEM）。
+     *
+     * AOSP 的比率计算点在 LocalDisplayDevice#setDisplayBrightness：
+     *     if (mLocalDisplayDeviceExt.isSupportSdrToHdrRatio() && nits != 0 && sdrNits != 0)
+     *         handleHdrSdrNitsChanged(nits, sdrNits);
+     * 类原生上该方法返回 false → 比率恒 1.0。闸门不开，光把面板推亮也不会产生 HDR 比值。
+     *
+     * 字段名在不同 ROM 上可能是 mLocalDisplayDeviceExt / mLocalDisplayDeviceExtImpl，
+     * 类型可能是 class 也可能是 interface —— 因此按名字找不到时按类型名扫描一遍。
+     * 失败必须留下日志：旧实现 catch 后静默 return，导致「看起来挂上了其实什么都没做」。
+     */
     private fun hookExt(devObj: Any?) {
         if (extHooked || devObj == null) return
         try {
-            val ext = XposedHelpers.getObjectField(devObj, "mLocalDisplayDeviceExt") ?: return
+            val ext = findExt(devObj)
+            if (ext == null) {
+                extHooked = true
+                val fields = try {
+                    devObj.javaClass.declaredFields.joinToString(",") { it.name }
+                } catch (_: Throwable) {
+                    "?"
+                }
+                XposedBridge.log(
+                    "$TAG: aosp ratio gate SKIPPED: no LocalDisplayDeviceExt field on " +
+                        devObj.javaClass.name + " fields=[" + fields + "]"
+                )
+                return
+            }
             val extCls = ext.javaClass
             val n = XposedBridge.hookAllMethods(extCls, "isSupportSdrToHdrRatio", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (enabled()) param.result = true
                 }
             }).size
+            extHooked = true
             if (n > 0) {
-                extHooked = true
                 XposedBridge.log(
                     "$TAG: aosp ratio gate opened on " + extCls.name + " (" + n + " method)"
                 )
+            } else {
+                val cand = try {
+                    extCls.declaredMethods.map { it.name }.filter { it.contains("Ratio", true) }
+                        .distinct().joinToString(",")
+                } catch (_: Throwable) {
+                    "?"
+                }
+                XposedBridge.log(
+                    "$TAG: aosp ratio gate MISSING: " + extCls.name +
+                        " has no isSupportSdrToHdrRatio; ratio-ish methods=[" + cand + "]"
+                )
             }
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            extHooked = true
+            XposedBridge.log("$TAG: aosp ratio gate failed: " + t)
         }
+    }
+
+    /**
+     * AOSP 真正的 HDR 比值闸门。
+     *
+     * AOSP 16 LocalDisplayAdapter$LocalDisplayDevice$1#setDisplayBrightness 里只有这一句：
+     *     if (getDisplayDeviceConfig().hasSdrToHdrRatioSpline()) handleHdrSdrNitsChanged(nits, sdrNits);
+     * 面板 XML 没声明 sdr-to-hdr-ratio-spline 时该方法返回 false → 比值永不计算。
+     * 本机实测 hasSdrToHdrRatioSpline=false，所以类原生上比值恒为初始 NaN。
+     *
+     * 直接放行即可：handleHdrSdrNitsChanged 自己会用 backlightToNits 算 nits/sdrNits，
+     * HDR 关时 brightness == sdrBrightness → 比值自然回到 1.0，不需要我们再收拾。
+     *
+     * 注意：OPPO 的 isSupportSdrToHdrRatio() 是另一套（仅 ColorOS 存在），两者都要挂。
+     */
+    private fun hookAospRatioGate(classLoader: ClassLoader): Int = try {
+        val cls = XposedHelpers.findClass("com.android.server.display.DisplayDeviceConfig", classLoader)
+        val n = XposedBridge.hookAllMethods(cls, "hasSdrToHdrRatioSpline", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                param.result = true
+            }
+        }).size
+        if (n > 0) {
+            XposedBridge.log("$TAG: aosp ratio gate opened on DisplayDeviceConfig.hasSdrToHdrRatioSpline (" + n + " method)")
+        } else {
+            XposedBridge.log("$TAG: aosp ratio gate MISSING: hasSdrToHdrRatioSpline not found")
+        }
+        n
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: aosp ratio gate failed: " + t.message)
+        0
+    }
+
+    /**
+     * 比值诊断探针：证明 handleHdrSdrNitsChanged 到底有没有被调用、算出来的比值是多少。
+     * 这是类原生上「到底卡在哪一环」的最终判据：
+     *   没有这行 → 闸门没开（hasSdrToHdrRatioSpline 没挂上）
+     *   有这行但 nits==sdrNits → 亮度没推上去
+     */
+    private fun hookHdrRatioProbe(classLoader: ClassLoader): Int = try {
+        val inner = XposedHelpers.findClass(
+            "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice" + D + "1", classLoader
+        )
+        XposedBridge.hookAllMethods(inner, "handleHdrSdrNitsChanged", object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                if (!enabled()) return
+                val nits = param.args.getOrNull(0) as? Float ?: return
+                val sdrNits = param.args.getOrNull(1) as? Float ?: return
+                logEvery("ratio", 2000L) {
+                    "$TAG: ratio probe nits=" + f2(nits) + " sdrNits=" + f2(sdrNits) +
+                        " -> ratio=" + f2(if (sdrNits > 0f) nits / sdrNits else Float.NaN)
+                }
+            }
+        }).size
+    } catch (t: Throwable) {
+        logEvery("probe", 60000L) { "$TAG: ratio probe unavailable: " + t.message }
+        0
+    }
+
+    /** 在 LocalDisplayDevice 上找到 ext 实现对象（字段名/类型名两种策略） */
+    private fun findExt(devObj: Any): Any? {
+        for (name in arrayOf("mLocalDisplayDeviceExt", "mLocalDisplayDeviceExtImpl")) {
+            try {
+                val v = XposedHelpers.getObjectField(devObj, name)
+                if (v != null) return v
+            } catch (_: Throwable) {
+            }
+        }
+        for (f in devObj.javaClass.declaredFields) {
+            val typeName = f.type.simpleName
+            if (!f.name.contains("LocalDisplayDeviceExt", true) &&
+                !typeName.contains("LocalDisplayDeviceExt", true)
+            ) continue
+            try {
+                f.isAccessible = true
+                val v = f.get(devObj)
+                if (v != null) return v
+            } catch (_: Throwable) {
+            }
+        }
+        return null
     }
 
     // ── F. 视频链路：媒体会话检测 ───────────────────────────
@@ -1260,9 +1537,16 @@ object HdrBoostHook {
                         if (d != null) callPriv(d, "checkIsPlayingHDR")
                         // 原生驱动会自己 sendUpdatePowerState；没有驱动时必须自己点火
                         requestPowerUpdate()
+                        // 类原生：主动把面板亮度推到顶（并保留 SDR 白点），否则永远等不到亮度变化事件
+                        pushAospBrightness(want)
                         try {
                             val h = dpcHandler
                             if (h != null) h.postDelayed({ requestPowerUpdate() }, 700L)
+                        } catch (_: Throwable) {
+                        }
+                        try {
+                            val h = dpcHandler
+                            if (h != null) h.postDelayed({ pushAospBrightness(hdrOn) }, 700L)
                         } catch (_: Throwable) {
                         }
                         val why = when {

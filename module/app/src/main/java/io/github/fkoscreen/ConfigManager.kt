@@ -50,11 +50,37 @@ object ConfigManager {
         return xPrefs!!
     }
 
+    /**
+     * 进程内可用的 Context。
+     *
+     * 模块自身进程用 currentApplication()；但被 hook 的 system_server 里 currentApplication()
+     * 常常是 null（没有 Application 实例），会导致 Settings.System 读不到 → 一路回退到
+     * XSharedPreferences → SELinux 拦截（avc denied）→ 开关失效 + 日志刷屏。
+     * 这里补 getSystemContext() 兜底：system_server 用它拿到的就是 SystemServer 的 Context。
+     */
+    private fun appContext(): Context? = try {
+        val at = Class.forName("android.app.ActivityThread")
+        val app = at.getMethod("currentApplication").invoke(null) as? Context
+        if (app != null) {
+            app
+        } else {
+            val thread = at.getMethod("currentActivityThread").invoke(null)
+            at.getMethod("getSystemContext").invoke(thread) as? Context
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
+    /** 当前进程是否就是模块自己的 App 进程（只有它读得到模块私有 prefs） */
+    private fun inModuleProcess(): Boolean = try {
+        appContext()?.packageName == PACKAGE_NAME
+    } catch (_: Throwable) {
+        false
+    }
+
     private fun getSettingInt(key: String): Int {
         return try {
-            val atClass = Class.forName("android.app.ActivityThread")
-            val app = atClass.getMethod("currentApplication").invoke(null) as? Context
-            val cr = app?.contentResolver ?: return -1
+            val cr = appContext()?.contentResolver ?: return -1
             android.provider.Settings.System.getInt(cr, key, -1)
         } catch (_: Throwable) {
             -1
@@ -124,6 +150,9 @@ object ConfigManager {
     private fun getBooleanConfig(key: String, def: Boolean): Boolean {
         val s = getSettingInt(key)
         if (s != -1) return s == 1
+        // 被 hook 的进程里读不到模块 prefs（SELinux），而模块界面每次改开关都会写
+        // Settings.System —— 所以这里读不到就直接用默认值，别再反复触发 avc denied。
+        if (!inModuleProcess()) return def
         return try {
             getXPrefs().getBoolean(key, def)
         } catch (_: Throwable) {
