@@ -56,6 +56,8 @@ object HdrBoostHook {
     private const val CODE_GET_HDR_STATE = 21012
     private const val SF_TOKEN = "android.ui.ISurfaceComposer"
     private const val POLL_MS = 400L
+    /** 类原生退出迟滞：HDR 消失后继续维持这么久才回落，消除瞬时闪烁 */
+    private const val HDR_EXIT_HOLD_MS = 1200L
 
     /** 认为「系统自己已经提亮过」的阈值：nit / sdrNit */
     private const val RATIO_DONE = 1.02f
@@ -1195,6 +1197,8 @@ object HdrBoostHook {
      */
     /** 闸门开放窗口：HDR 关闭后再保留 5s，用于让回落那一次也把比值算回 1.0 */
     @Volatile private var gateUntil = 0L
+    /** HDR 内容首次消失的时刻（用于退出迟滞） */
+    @Volatile private var hdrOffSince = 0L
 
     private fun hookAospRatioGate(classLoader: ClassLoader): Int = try {
         val cls = XposedHelpers.findClass("com.android.server.display.DisplayDeviceConfig", classLoader)
@@ -1604,11 +1608,21 @@ object HdrBoostHook {
                     // 三条信号：① 焦点窗口 colorMode ② 视频播放中 ③ 兜底（relayout 集合 / SF）
                     val focus = focusedWindowHdr()
                     val video = videoPlaying()
-                    val want = when {
+                    val raw = when {
                         focus == true -> true
                         video -> true
                         focus == null -> hdrWindows.isNotEmpty() || sfHdrPlaying()
                         else -> false
+                    }
+                    // 退出迟滞（仅类原生）：HDR 图片/瞬时窗口会让状态在几百毫秒内抖动，
+                    // 直连面板时表现为「闪一下又回去」。熄灭前要求连续缺失 HDR_EXIT_HOLD_MS。
+                    val nowMs = android.os.SystemClock.elapsedRealtime()
+                    val want = if (!raw && hdrOn && aospMode) {
+                        if (hdrOffSince == 0L) hdrOffSince = nowMs
+                        (nowMs - hdrOffSince) < HDR_EXIT_HOLD_MS
+                    } else {
+                        if (raw) hdrOffSince = 0L
+                        raw
                     }
                     if (want != hdrOn) {
                         hdrOn = want
