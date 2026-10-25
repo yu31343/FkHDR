@@ -204,6 +204,7 @@ object HdrBoostHook {
         aospMode = platform == PLAT_AOSP || forceAosp || oppoPathDead
         if (aospMode) {
             steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
+            steps.append(" force=").append(hookForceSurfaceControl(classLoader))
             steps.append(" spec=").append(hookLocalDisplayAdapterForSpecific(classLoader))
             // 注意：原先这里还有 hookAospRatioGate(DisplayDeviceConfig.hasSdrToHdrRatioSpline)。
             // 实机已证明该 hook 被 ART 内联、完全不生效，且它会在 HDR 期间每帧放行
@@ -807,7 +808,7 @@ object HdrBoostHook {
     private fun boost(mgr: Any, builder: Any): Boolean {
         return try {
             // 专项链路下系统自己会算，兜底必须完全静默
-            if (specificMode) {
+            if (specOn()) {
                 logEvery("boost_skip_spec", 10000L) { "$TAG: boost skipped (specific chain)" }
                 return false
             }
@@ -1136,7 +1137,7 @@ object HdrBoostHook {
         // 开关关掉后绝不能继续推亮度（这里是自己塞 callArgs[1]，不经过 before-hook 的 enabled 检查）
         if (!enabled()) return
         // 曲线已装上：亮度交给 DPC 自己算，避免硬跳变（无 ramp）
-        if (specificMode || splineInstalled) return
+        if (specOn() || splineInstalled) return
         val dev = aospDev
         if (dev == null) {
             logEvery("aospnodev", 5000L) {
@@ -1432,7 +1433,7 @@ object HdrBoostHook {
             // 专项链路：系统自己算，我们只在它「算不出」时兜底。
             // 注意不能只看 currentHdrSdrRatio().isNaN() —— hookRatioNeverNaN 会把 NaN 归一成 1.0，
             // 那样就永远判不出「系统没算」。所以用「最近 1.5s 内系统写过 NaN」作为判据。
-            val needFallback = if (specificMode) {
+            val needFallback = if (specOn()) {
                 (now - sysRatioNaNSince) < 1500L ||
                     currentHdrSdrRatio().let { it.isNaN() || it <= 0f }
             } else {
@@ -1691,6 +1692,50 @@ object HdrBoostHook {
         }
     }
 
+    @Volatile private var forceSurfaceControlSet = false
+
+    /**
+     * ①' 把 mForceSurfaceControl 置 true —— 这是「与 AOSP 对齐」的关键一步。
+     *
+     * 设备里的 LocalDisplayDevice 构造函数：
+     *     mBacklightAdapter.setForceSurfaceControl(
+     *             mDisplayDeviceConfig.hasQuirk("canSetBrightnessViaHwc"));
+     * 本机该 quirk 为 false，加上 mUseSurfaceControlBrightness 也是 false，
+     * 于是厂商在 handleHdrSdrNitsChanged 里加的
+     *     if (!(use || force)) goto NaN;
+     * 永远成立 -> 比值恒 NaN。
+     *
+     * 而 AOSP android15 的 setDisplayBrightness 只有一道门：
+     *     if (getDisplayDeviceConfig().hasSdrToHdrRatioSpline()) handleHdrSdrNitsChanged(...)
+     * 根本没有 use/force/mSupportUltraHDR 这些条件。
+     * 所以把这两个标志置位后，设备行为就与 AOSP 完全一致，比值由系统自己算。
+     */
+    private fun hookForceSurfaceControl(classLoader: ClassLoader): Int = try {
+        val cls = XposedHelpers.findClass(
+            "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice", classLoader
+        )
+        val n = XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    val ba = XposedHelpers.getObjectField(param.thisObject, "mBacklightAdapter")
+                    XposedHelpers.callMethod(ba, "setForceSurfaceControl", true)
+                    forceSurfaceControlSet = true
+                    XposedBridge.log(
+                        "$TAG: AOSP-align ①' mForceSurfaceControl = true (vendor gate opened)"
+                    )
+                } catch (t: Throwable) {
+                    logEvery("forcefail", 60000L) {
+                        "$TAG: setForceSurfaceControl(true) failed: " + t
+                    }
+                }
+            }
+        })
+        n.size
+    } catch (t: Throwable) {
+        logEvery("forcehook", 60000L) { "$TAG: LocalDisplayDevice ctor hook failed: " + t.message }
+        0
+    }
+
     /** ② 放开 mSupportUltraHDR（等效旧模块删掉那个与条件） */
     private fun hookLocalDisplayAdapterForSpecific(classLoader: ClassLoader): Boolean = try {
         val cls = XposedHelpers.findClass("com.android.server.display.LocalDisplayAdapter", classLoader)
@@ -1713,9 +1758,17 @@ object HdrBoostHook {
     @Volatile private var splineProxy: Any? = null
     @Volatile private var lastModeCheckAt = 0L
 
+    /** 本次 HDR 会话内专项链路没生效 -> 临时退回通用兜底 */
+    @Volatile private var specFallback = false
+    @Volatile private var hdrOnSince = 0L
+
     private fun updateSpecificMode() {
-        specificMode = splineInstalled && ultraHdrForced
+        // 三个条件都满足 = 厂商加的门禁已被完全打开 = 设备行为回到 AOSP
+        specificMode = splineInstalled && ultraHdrForced && forceSurfaceControlSet
     }
+
+    /** 当前是否真的按「专项链路（系统自算）」运行 */
+    private fun specOn(): Boolean = specificMode && !specFallback
 
     /**
      * 周期性自检，解决两个「永久卡死」：
@@ -1782,7 +1835,7 @@ object HdrBoostHook {
     private fun applyHbm(boost: Boolean) {
         if (!aospMode || !enabled() || !hbmEnabled()) return
         // 专项链路：HBM 由系统自己的 SurfaceControlHdrLayerInfoListener 决定，模块不介入
-        if (specificMode) return
+        if (specOn()) return
         val c = hbmCtl ?: run {
             logEvery("hbmnoctl", 10000L) { "$TAG: HBM skipped: controller not captured" }
             return
@@ -2313,6 +2366,19 @@ object HdrBoostHook {
                             XposedBridge.log("$TAG: ratio tail-restore 1.0 (was " + f2(cur) + ")")
                         }
                     }
+                    // ③ 专项链路自检：AOSP 链路本该在 HDR 出现后立刻自己算出比值。
+                    //    如果 2 秒后系统仍然只报 1.0，说明这条 ROM 上 SF 没把 HDR 信息送下来，
+                    //    本会话退回通用兜底。
+                    if (hdrOn && specificMode && !specFallback &&
+                        nowTail - hdrOnSince > 2000L &&
+                        currentHdrSdrRatio() <= 1.05f
+                    ) {
+                        specFallback = true
+                        XposedBridge.log(
+                            "$TAG: specific chain ineffective after 2s (ratio=" +
+                                f2(currentHdrSdrRatio()) + ") -> fallback to GENERIC for this session"
+                        )
+                    }
                     // 三条信号：① 焦点窗口 colorMode ② 视频播放中 ③ 兜底（relayout 集合 / SF）
                     val focus = focusedWindowHdr()
                     val video = videoPlaying()
@@ -2339,13 +2405,16 @@ object HdrBoostHook {
                         hdrOn = want
                         if (!want) {
                             gateUntil = android.os.SystemClock.elapsedRealtime() + 5000L
+                            // 退出时清掉会话级回退，下次 HDR 重新尝试专项链路
+                            specFallback = false
                         } else {
                             lastForcedRatio = Float.NaN
+                            hdrOnSince = android.os.SystemClock.elapsedRealtime()
                         }
                         // 专项链路：全部交给系统（曲线 + 门禁已就位）。
                         // 注意 700ms 的 postDelayed 也必须一起挡住，否则专项链路下仍会点火。
                         val d = hdrEnhance
-                        if (!specificMode) {
+                        if (!specOn()) {
                             if (d != null) callPriv(d, "checkIsPlayingHDR")
                             // 原生驱动会自己 sendUpdatePowerState；没有驱动时必须自己点火
                             requestPowerUpdate()
