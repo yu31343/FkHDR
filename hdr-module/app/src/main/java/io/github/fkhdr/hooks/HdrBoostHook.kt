@@ -203,15 +203,18 @@ object HdrBoostHook {
         val forceAosp = prop2(PROP_AOSP_FORCE, PROP_AOSP_FORCE_OLD, "0") == "1"
         aospMode = platform == PLAT_AOSP || forceAosp || oppoPathDead
         if (aospMode) {
-            steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
+            specificOnlyChain = specificChainPossible(classLoader)
             steps.append(" force=").append(hookForceSurfaceControl(classLoader))
             steps.append(" spec=").append(hookLocalDisplayAdapterForSpecific(classLoader))
-            // 注意：原先这里还有 hookAospRatioGate(DisplayDeviceConfig.hasSdrToHdrRatioSpline)。
-            // 实机已证明该 hook 被 ART 内联、完全不生效，且它会在 HDR 期间每帧放行
-            // updateDeviceInfoLocked，成为第二个 display-changed 事件源（MIUI 桌面崩溃诱因）。
-            // 现已删除，比值改由 pushRatioDirect 自算自调，不依赖任何门禁 hook。
-            steps.append(" hbm=").append(hookHighBrightnessModeController(classLoader))
+            if (!specificOnlyChain) {
+                // 补偿链路：只有开不出门禁的 ROM 才需要
+                steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
+                steps.append(" hbm=").append(hookHighBrightnessModeController(classLoader))
+            }
+            steps.append(" chain=").append(if (specificOnlyChain) "SPECIFIC-ONLY" else "GENERIC")
         }
+        // 注意：hookAospRatioGate(DisplayDeviceConfig.hasSdrToHdrRatioSpline) 已删除。
+        // 实机证明它被 ART 内联、完全不生效，且会在 HDR 期间每帧放行 updateDeviceInfoLocked。
 
         // ── 通用：三类平台都挂（都是 AOSP 基础类，必然存在）──
         // DisplayInfo 伪装也放通用段：patchDisplayInfo 自带守卫（已含 11/12 就原样返回），
@@ -219,9 +222,13 @@ object HdrBoostHook {
         steps.append(" forge=").append(hookDisplayInfoForgery(classLoader))
         steps.append(" nan=").append(hookRatioNeverNaN(classLoader))
         steps.append(" dpc=").append(hookDisplayPowerController(classLoader))
-        steps.append(" media=").append(hookMediaSessions(classLoader))
-        steps.append(" wms=").append(hookWindowManager(classLoader))
-        startWatcher()
+        // 专项链路下，HDR 检测完全由系统自己的 SurfaceControlHdrLayerInfoListener 完成，
+        // 模块不需要媒体会话/焦点窗口/状态机 —— 这些全部不挂。
+        if (!specificOnlyChain) {
+            steps.append(" media=").append(hookMediaSessions(classLoader))
+            steps.append(" wms=").append(hookWindowManager(classLoader))
+            startWatcher()
+        }
         XposedBridge.log("$TAG: init done [" + steps + "] factor=" + factor())
     }
 
@@ -746,7 +753,11 @@ object HdrBoostHook {
                     installSpecificSpline()
                     updateSpecificMode()
                     XposedBridge.log(
-                        "$TAG: chain = " + (if (specificMode) "SPECIFIC(系统自算)" else "GENERIC(模块代劳)")
+                        "$TAG: chain = " + when {
+                            specificOnlyChain -> "SPECIFIC-ONLY(系统自算, 无补偿钩子)"
+                            specificMode -> "SPECIFIC(系统自算)"
+                            else -> "GENERIC(模块代劳)"
+                        }
                     )
                 } catch (t: Throwable) {
                     logEvery("cfg", 60000L) { "$TAG: display config unavailable: " + t.message }
@@ -1706,6 +1717,52 @@ object HdrBoostHook {
     @Volatile private var localDisplayAdapter: Any? = null
 
     /**
+     * 是否「只走专项链路」—— 启动时一次性判定，判定成功后**根本不安装任何补偿钩子**。
+     *
+     * 这是对「旧模块为什么没问题」的直接回答：旧模块是改磁盘上的系统，
+     * 改完之后系统里没有补偿逻辑，自然不会打架。我们等价的做法就是：
+     * 只要能开出门禁，就完全不挂 setDisplayBrightness / requestDisplayStateLocked /
+     * HBM 强制 / 状态机 watcher —— 挂不上的钩子永远不会有多余行为。
+     */
+    @Volatile private var specificOnlyChain = false
+
+    private fun hasField(c: Class<*>, name: String): Boolean = try {
+        c.getDeclaredField(name)
+        true
+    } catch (_: Throwable) {
+        false
+    }
+
+    private fun hasMethod(c: Class<*>, name: String, vararg p: Class<*>): Boolean = try {
+        c.getDeclaredMethod(name, *p)
+        true
+    } catch (_: Throwable) {
+        false
+    }
+
+    private fun specificChainPossible(cl: ClassLoader): Boolean = try {
+        val adapter = XposedHelpers.findClass("com.android.server.display.LocalDisplayAdapter", cl)
+        val backlight = XposedHelpers.findClass(
+            "com.android.server.display.LocalDisplayAdapter" + D + "BacklightAdapter", cl
+        )
+        val cfg = XposedHelpers.findClass("com.android.server.display.DisplayDeviceConfig", cl)
+        val ok = hasField(adapter, "mSupportUltraHDR") &&
+            hasMethod(backlight, "setForceSurfaceControl", java.lang.Boolean.TYPE) &&
+            hasField(cfg, "mSdrToHdrRatioSpline")
+        XposedBridge.log(
+            "$TAG: specific-chain probe -> " + ok +
+                " [mSupportUltraHDR=" + hasField(adapter, "mSupportUltraHDR") +
+                " setForceSurfaceControl=" +
+                hasMethod(backlight, "setForceSurfaceControl", java.lang.Boolean.TYPE) +
+                " mSdrToHdrRatioSpline=" + hasField(cfg, "mSdrToHdrRatioSpline") + "]"
+        )
+        ok
+    } catch (t: Throwable) {
+        logEvery("specprobe", 60000L) { "$TAG: specific-chain probe failed: " + t.message }
+        false
+    }
+
+    /**
      * ①' 把 mForceSurfaceControl 置 true —— 这是「与 AOSP 对齐」的关键一步。
      *
      * 设备里的 LocalDisplayDevice 构造函数：
@@ -1819,7 +1876,7 @@ object HdrBoostHook {
     }
 
     /** 当前是否真的按「专项链路（系统自算）」运行 */
-    private fun specOn(): Boolean = specificMode && !specFallback
+    private fun specOn(): Boolean = specificOnlyChain || (specificMode && !specFallback)
 
     /**
      * 周期性自检，解决两个「永久卡死」：
