@@ -1,0 +1,232 @@
+package io.github.fkhdr.ui
+
+import android.app.Activity
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.os.Bundle
+import android.view.View
+import android.view.ViewGroup
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.Switch
+import android.widget.TextView
+import io.github.fkhdr.Config
+import io.github.fkhdr.R
+
+/**
+ * FkHDR 主界面。
+ *
+ * 刻意只用手写 Android SDK View：不引入 Compose、不引入 androidx，模块 APK 只有几十 KB，
+ * 也避免任何三方依赖被注入到 system_server 时带来的类冲突风险。
+ */
+class MainActivity : Activity() {
+
+    private lateinit var hdrSwitch: Switch
+    private lateinit var statusText: TextView
+
+    /** 程序化回写开关状态时置位，避免触发监听器造成回环写入 */
+    private var binding = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setTitle(R.string.app_name)
+        setContentView(buildContentView())
+        applyState(Config.isHdrFixEnabled())
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::hdrSwitch.isInitialized) applyState(Config.isHdrFixEnabled())
+    }
+
+    /**
+     * 写入后回读校验。
+     *
+     * 开关是靠 Settings.System 传给 system_server 的（LSPosed 注入的进程读不到本模块私有 prefs），
+     * 而普通应用默认没有 WRITE_SETTINGS 权限。两条兜底：
+     *   ① LSPosed 作用域勾了 com.android.providers.settings -> SettingsProviderHook 放行写入
+     *   ② 有 root -> su 写入
+     * 两条都不通时开关只是「看起来切了」，必须明确告诉用户，否则会以为模块坏了。
+     */
+    private fun verifyPersisted(isChecked: Boolean) {
+        val expected = if (isChecked) 1 else 0
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            if (Config.getSettingInt(Config.KEY_HDR_RATIO) == expected) return@postDelayed
+            android.widget.Toast.makeText(
+                this,
+                "开关未能写入系统设置。请在 LSPosed 中为本模块勾选「设置存储 (com.android.providers.settings)」" +
+                    "作用域，或授予本应用 root 权限后重试。",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+        }, 1500)
+    }
+
+    // ── UI 构建 ─────────────────────────────────────────────
+
+    private fun buildContentView(): View {
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(BG)
+            isFillViewport = true
+        }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(22), dp(20), dp(32))
+        }
+        scroll.addView(root, ViewGroup.LayoutParams(MATCH, WRAP))
+
+        root.addView(text(getString(R.string.app_name) + " · HDR 提亮修复", 22f, TEXT, true))
+        root.addView(text("独立 LSPosed 模块 · 不依赖 FkOScreen", 13f, MUTED).withTop(dp(6)))
+
+        // 开关卡片
+        val switchCard = card().withTop(dp(20))
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        row.addView(
+            text("HDR 提亮修复", 16f, TEXT, true),
+            LinearLayout.LayoutParams(0, WRAP, 1f)
+        )
+        hdrSwitch = Switch(this).apply {
+            isChecked = false
+            setOnCheckedChangeListener { _, isChecked ->
+                if (binding) return@setOnCheckedChangeListener
+                Config.writeConfig(this@MainActivity, Config.KEY_HDR_RATIO, isChecked)
+                applyState(isChecked)
+                verifyPersisted(isChecked)
+            }
+        }
+        row.addView(hdrSwitch, LinearLayout.LayoutParams(WRAP, WRAP))
+        switchCard.addView(row)
+        statusText = text("", 13f, MUTED).withTop(dp(8))
+        switchCard.addView(statusText)
+        root.addView(switchCard)
+
+        // 作用
+        val effect = card().withTop(dp(12))
+        effect.addView(sectionTitle("作用"))
+        effect.addView(
+            text(
+                "HDR 内容出现时，把面板亮度推到物理最大值，并向系统上报真实的 HDR/SDR 比值；" +
+                    "SDR 白点保持不变，退出 HDR 后自动回落。",
+                14f, BODY
+            ).withTop(dp(8))
+        )
+        root.addView(effect)
+
+        // 支持系统
+        val systems = card().withTop(dp(12))
+        systems.addView(sectionTitle("支持系统"))
+        systems.addView(
+            text(
+                "ColorOS 16 / 17（realme UI、OxygenOS 等同源机型）；" +
+                    "类原生 AOSP / LineageOS / Pixel Experience 等。",
+                14f, BODY
+            ).withTop(dp(8))
+        )
+        root.addView(systems)
+
+        // 生效范围
+        val scope = card().withTop(dp(12))
+        scope.addView(sectionTitle("生效范围"))
+        scope.addView(
+            text(
+                "LSPosed 作用域需勾选「系统框架（android）」与「设置存储（com.android.providers.settings）」，" +
+                    "未勾选则开关无效。",
+                14f, BODY
+            ).withTop(dp(8))
+        )
+        root.addView(scope)
+
+        // 提示
+        val tips = card().withTop(dp(12))
+        tips.addView(sectionTitle("注意"))
+        tips.addView(
+            text(
+                "开关改动后需重启 system_server 或重启设备才会完整生效；" +
+                    "若当前正在播放 HDR 内容，切换后会立即重新计算一次亮度。",
+                14f, BODY
+            ).withTop(dp(8))
+        )
+        root.addView(tips)
+
+        root.addView(
+            text(versionLabel(), 12f, FAINT)
+                .withTop(dp(22))
+                .also { it.gravity = android.view.Gravity.CENTER_HORIZONTAL }
+        )
+
+        return scroll
+    }
+
+    private fun applyState(enabled: Boolean) {
+        binding = true
+        hdrSwitch.isChecked = enabled
+        binding = false
+        statusText.text = if (enabled) {
+            "已开启 · HDR 内容出现时自动提亮面板"
+        } else {
+            "已关闭 · 保持系统原始亮度行为"
+        }
+        statusText.setTextColor(if (enabled) ENABLED else MUTED)
+    }
+
+    // ── 小工具 ──────────────────────────────────────────────
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
+
+    private fun text(t: CharSequence, sizeSp: Float, color: Int, bold: Boolean = false): TextView =
+        TextView(this).apply {
+            text = t
+            textSize = sizeSp
+            setTextColor(color)
+            if (bold) setTypeface(typeface, Typeface.BOLD)
+            setLineSpacing(dp(3).toFloat(), 1.0f)
+        }
+
+    private fun sectionTitle(t: CharSequence): TextView = text(t, 13f, HEADING, true)
+
+    private fun card(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            cornerRadius = dp(14).toFloat()
+            setColor(Color.WHITE)
+            setStroke(dp(1), BORDER)
+        }
+    }
+
+    private fun <T : View> T.withTop(margin: Int): T {
+        val lp = LinearLayout.LayoutParams(MATCH, WRAP)
+        lp.topMargin = margin
+        layoutParams = lp
+        return this
+    }
+
+    @Suppress("DEPRECATION")
+    private fun versionLabel(): String {
+        val info = try {
+            packageManager.getPackageInfo(packageName, 0)
+        } catch (_: Throwable) {
+            null
+        }
+        val name = info?.versionName ?: "1.0.0"
+        val code = info?.versionCode ?: 1
+        return "FkHDR v" + name + " (" + code + ")"
+    }
+
+    private companion object {
+        const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+        const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+
+        val BG = Color.parseColor("#FFF4F5F7")
+        val BORDER = Color.parseColor("#FFE3E5E9")
+        val TEXT = Color.parseColor("#FF111827")
+        val HEADING = Color.parseColor("#FF374151")
+        val BODY = Color.parseColor("#FF4B5563")
+        val MUTED = Color.parseColor("#FF8A94A6")
+        val FAINT = Color.parseColor("#FFAAB2BF")
+        val ENABLED = Color.parseColor("#FF16A34A")
+    }
+}

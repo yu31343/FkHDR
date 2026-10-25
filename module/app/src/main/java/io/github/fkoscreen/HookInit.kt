@@ -8,6 +8,27 @@ import io.github.fkoscreen.hooks.*
 class HookInit : IXposedHookLoadPackage {
     companion object {
         private const val TAG = "FkOScreen:HookInit"
+        /** 独立 HDR 模块（从本模块拆分出去） */
+        private const val STANDALONE_HDR_PKG = "io.github.benbaobaoshigemi.fkhdr"
+
+        /**
+         * 独立 HDR 模块是否已安装。
+         *
+         * HDR 提亮已拆分到 FkHDR。两个模块同时接管同一条提亮链会重复点火
+         * （两套 watcher 各自 checkIsPlayingHDR / sendUpdatePowerState / 推亮度），
+         * 所以检测到独立模块在场时，本模块主动让位。
+         *
+         * 检测失败一律按「未安装」处理：宁可重复，也不要静默丢掉 HDR。
+         */
+        private fun standaloneHdrInstalled(): Boolean = try {
+            val at = Class.forName("android.app.ActivityThread")
+            val thread = at.getMethod("currentActivityThread").invoke(null)
+            val ctx = at.getMethod("getSystemContext").invoke(thread) as android.content.Context
+            ctx.packageManager.getPackageInfo(STANDALONE_HDR_PKG, 0)
+            true
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -16,7 +37,14 @@ class HookInit : IXposedHookLoadPackage {
                 XposedBridge.log("$TAG: Hooking system_server...")
                 BrightnessLimitHook.init(lpparam.classLoader)
                 FossBypassHook.init(lpparam.classLoader)
-                HdrBoostHook.init(lpparam.classLoader)
+                // HDR 提亮已拆分到独立模块 FkHDR；独立模块在场时本模块让位，避免双重点火
+                if (standaloneHdrInstalled()) {
+                    XposedBridge.log(
+                        "$TAG: standalone FkHDR installed -> skip built-in HDR hook (no double boost)"
+                    )
+                } else {
+                    HdrBoostHook.init(lpparam.classLoader)
+                }
                 ColorBallAnchorHook.initSystemServer(lpparam.classLoader)
                 SettingsProviderHook.init(lpparam.classLoader)
                 RefreshRate144Hook.initSystemServer(lpparam.classLoader)

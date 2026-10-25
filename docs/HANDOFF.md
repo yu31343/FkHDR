@@ -1,6 +1,6 @@
 # 会话交接文档（HANDOFF）
 
-> 最后更新：v1.9.2 / 2026-10-24
+> 最后更新：v1.9.4 / 2026-10-25（HDR 已拆分为独立模块 FkHDR）
 > 目的：下次会话 5 分钟内进入状态，不必重新逆向。
 
 ---
@@ -13,6 +13,11 @@ FkOScreen HDR 修复模块在 **ColorOS 16 上图片与视频 HDR 链路全部�
 v1.9.2 修好注入链（**实测面板背光 21→2047→21，物理提亮已生效**），但比值仍 NaN
 （闸门 hook 被 ART 内联）。v1.9.3 改为「自算自调 `handleHdrSdrNitsChanged`」并补
 `DisplayInfo` 伪装 + 退出迟滞。全过程见 `docs/lineage-aosp-no-effect.md`。
+
+**v1.9.4（2026-10-25）**：用户确认类原生生效后，HDR 已**拆分为独立 LSPosed 模块
+`FkHDR`**（`hdr-module/`，包名 `io.github.benbaobaoshigemi.fkhdr`，APK 703 KB，无 androidx 依赖）。
+原模块检测到 FkHDR 已安装时自动跳过内建 HDR hook，避免双重点火。
+见 `docs/fkhdr-standalone.md`。
 
 ---
 
@@ -277,8 +282,10 @@ module/app/src/main/java/io/github/fkoscreen/
 │   ├── FossBypassHook.kt          # 降亮度白名单绕过
 │   └── ...
 module/player/                     # ★ 验证播放器（勿删）
+hdr-module/                        # ★ 独立 HDR 模块（FkHDR，无 androidx，703 KB）
 docs/
 ├── HANDOFF.md                     # ★ 本文档
+├── fkhdr-standalone.md            # ★ HDR 拆分说明 + 开关通道实测约束
 ├── lineage-aosp-no-effect.md      # ★ 类原生"无效"日志闭环 + v1.9.2 修复 + 判读表
 ├── FEATURES.md                    # 功能总览 + 实测矩阵
 ├── c17-root-cause.md              # C17 根因
