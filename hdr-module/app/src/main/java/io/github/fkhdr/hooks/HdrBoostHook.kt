@@ -1693,6 +1693,7 @@ object HdrBoostHook {
     }
 
     @Volatile private var forceSurfaceControlSet = false
+    @Volatile private var localDisplayAdapter: Any? = null
 
     /**
      * ①' 把 mForceSurfaceControl 置 true —— 这是「与 AOSP 对齐」的关键一步。
@@ -1718,6 +1719,10 @@ object HdrBoostHook {
             override fun afterHookedMethod(param: MethodHookParam) {
                 try {
                     val ba = XposedHelpers.getObjectField(param.thisObject, "mBacklightAdapter")
+                    try {
+                        localDisplayAdapter = XposedHelpers.getObjectField(param.thisObject, "this" + D + "0")
+                    } catch (_: Throwable) {
+                    }
                     XposedHelpers.callMethod(ba, "setForceSurfaceControl", true)
                     forceSurfaceControlSet = true
                     XposedBridge.log(
@@ -1767,6 +1772,25 @@ object HdrBoostHook {
         specificMode = splineInstalled && ultraHdrForced && forceSurfaceControlSet
     }
 
+    /** 周期性把厂商加的两道门禁重新置 true（等效于旧模块「反编译删掉那三个判断」） */
+    private fun reassertVendorGates() {
+        try {
+            val adapter = localDisplayAdapter
+            if (adapter != null) {
+                XposedHelpers.setBooleanField(adapter, "mSupportUltraHDR", true)
+            }
+        } catch (_: Throwable) {
+        }
+        try {
+            val dev = aospDev
+            if (dev != null) {
+                val ba = XposedHelpers.getObjectField(dev, "mBacklightAdapter")
+                XposedHelpers.callMethod(ba, "setForceSurfaceControl", true)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
     /** 当前是否真的按「专项链路（系统自算）」运行 */
     private fun specOn(): Boolean = specificMode && !specFallback
 
@@ -1780,6 +1804,9 @@ object HdrBoostHook {
         if (now - lastModeCheckAt < 3000L) return
         lastModeCheckAt = now
         if (!ultraHdrForced) updateSpecificMode()
+        // 重申门禁标志：ROM 可能在别处重置 mSupportUltraHDR / mForceSurfaceControl，
+        // 一旦被重置，系统就会退回「比值恒 NaN」。这里每 3s 补一次，成本可忽略。
+        reassertVendorGates()
         val cfg = displayConfig
         if (cfg != null && splineInstalled) {
             try {

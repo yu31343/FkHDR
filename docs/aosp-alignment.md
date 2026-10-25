@@ -115,27 +115,46 @@ if (displayNits != -1 && sdrNits != -1
 `Display.isHdrSdrRatioAvailable()`（= `!Float.isNaN(hdrSdrRatio)`）恒 false ⇒
 验收 App 不注册 `registerHdrSdrRatioChangedListener` ⇒ 界面永远停在 1.0。
 
-### 2.1 对旧模块的重新评估
+### 2.1 对旧模块的重新评估（已用 smali 级 diff 核实）
 
 设备上原来的 `hdr_sdr_ratio_fix` 模块做了两件事：
 
 1. 改 `display_id_*.xml` 的 `sdrHdrRatioMap`：`2 nits → 5.0`，`650 nits → 1.0`
-2. 反编译 services.jar 删掉 `&& LocalDisplayAdapter.mSupportUltraHDR`
+2. 替换 `services.jar`
 
-**第 2 条在本机是无用补丁** —— 因为 `(use || force)` 仍然是 false，
-删掉 `mSupportUltraHDR` 之后条件依旧不成立，比值仍然 NaN。
-旧模块真正生效的只有第 1 条（提亮），比值从未被修好。
+对「模块内 services.jar」与「原厂 services.jar」做 `baksmali` 后逐行 diff：
 
-## 3. 对齐方案（v1.4.0）
+```diff
+- if-eqz v1, :cond_35                     # displayNits != -1
++ if-eqz v1, :cond_13
+- if-eqz v0, :cond_35                     # sdrNits != -1
+- ... -$$Nest$fgetmUseSurfaceControlBrightness
+- ... -$$Nest$fgetmForceSurfaceControl
+- ... -$$Nest$fgetmSupportUltraHDR
++ if-eqz v0, :cond_13
+```
 
-不改文件、不重打包，运行时把厂商多出来的两个标志置位，让设备回到 AOSP 语义：
+即**三道门禁被整块删除**，方法体变成：
 
-| 步骤 | 实现 |
+```java
+if (displayNits != -1 && sdrNits != -1) ratio = Math.max(1.0f, displayNits / sdrNits);
+else                                     ratio = Float.NaN;
+```
+
+与 AOSP 原版**逐字节等价**。整个 `classes2.dex` 里 `com/android/server/display/` 包下
+只有这一个文件存在实质差异（其余差异都是 `.line` 行号噪声）。
+
+> 更正：早期我只看 diff 的一小段，误判为「只删了 `mSupportUltraHDR` 一条、在本机无效」。
+> 实际是三条一起删。用户实测该模块正常，与本结论一致。
 |---|---|
 | ① `mSupportUltraHDR = true` | hook `LocalDisplayAdapter` 构造函数（after），写字段 |
 | ①' `mForceSurfaceControl = true` | hook `LocalDisplayDevice` 构造函数（after），调 `mBacklightAdapter.setForceSurfaceControl(true)` |
 | ② 面板比值曲线 | 替换 `DisplayDeviceConfig.mSdrToHdrRatioSpline`（等效旧模块改 XML，cap 由 App 配，默认 5.0） |
 | ③ NaN 安全网 | `updateDeviceInfoLocked` / `getDisplayDeviceInfoLocked` 里把 NaN 归一成 1.0 |
+| ④ 周期性重申 | `refreshSpecificMode()` 每 3s 重新置位 ①②，防止 ROM 在别处重置 |
+
+> ①②④ 达到的最终状态与旧模块「删掉三道门禁」**逻辑等价**：
+> 三个条件全为 true 时走的正是同一条分支，比值由系统按 `max(1, nits/sdrNits)` 计算。
 
 三者都成功 ⇒ `chain = SPECIFIC(系统自算)`，模块**不再**：推亮度、强制 HBM、
 写 `mCurrentHdrSdrRatio`、主动点火 DPC。全部由 AOSP 原生链路完成。
