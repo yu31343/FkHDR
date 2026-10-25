@@ -37,9 +37,15 @@ object Config {
         } catch (_: Throwable) {
             null
         }
-        val v = fromSettings ?: try {
-            getXPrefs().getFloat(KEY_RATIO_MAX, DEFAULT_RATIO_MAX)
-        } catch (_: Throwable) {
+        // 与 getBooleanConfig 一致：system_server 里绝不碰 XSharedPreferences（会 avc denied 刷屏，
+        // 而且这里处在亮度 ramp 的关键路径上，文件 IO 会直接掉帧）。
+        val v = fromSettings ?: if (inModuleProcess()) {
+            try {
+                getXPrefs().getFloat(KEY_RATIO_MAX, DEFAULT_RATIO_MAX)
+            } catch (_: Throwable) {
+                DEFAULT_RATIO_MAX
+            }
+        } else {
             DEFAULT_RATIO_MAX
         }
         return v.coerceIn(MIN_RATIO_MAX, MAX_RATIO_MAX)

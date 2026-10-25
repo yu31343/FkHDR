@@ -205,7 +205,10 @@ object HdrBoostHook {
         if (aospMode) {
             steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
             steps.append(" spec=").append(hookLocalDisplayAdapterForSpecific(classLoader))
-            steps.append(" gate=").append(hookAospRatioGate(classLoader))
+            // 注意：原先这里还有 hookAospRatioGate(DisplayDeviceConfig.hasSdrToHdrRatioSpline)。
+            // 实机已证明该 hook 被 ART 内联、完全不生效，且它会在 HDR 期间每帧放行
+            // updateDeviceInfoLocked，成为第二个 display-changed 事件源（MIUI 桌面崩溃诱因）。
+            // 现已删除，比值改由 pushRatioDirect 自算自调，不依赖任何门禁 hook。
             steps.append(" hbm=").append(hookHighBrightnessModeController(classLoader))
         }
 
@@ -803,6 +806,11 @@ object HdrBoostHook {
 
     private fun boost(mgr: Any, builder: Any): Boolean {
         return try {
+            // 专项链路下系统自己会算，兜底必须完全静默
+            if (specificMode) {
+                logEvery("boost_skip_spec", 10000L) { "$TAG: boost skipped (specific chain)" }
+                return false
+            }
             if (!fallbackEnabled()) {
                 logEvery("fb_off", 5000L) { "$TAG: fallback disabled by " + PROP_FALLBACK }
                 return false
@@ -828,7 +836,15 @@ object HdrBoostHook {
             }
             val cap = ratioCapAt(mgr, base)
             lastRatioCap = cap
-            val target = minOf(maxNit, base * factor(), base * cap)
+            if (cap >= 1e6f) {
+                // 面板没有 sdrHdrRatioMap：拿不到物理上限，退回 App 设定的 cap，
+                // 绝不能用 factor()（默认 100）当乘数，否则 target 恒等于面板最大 = 硬推。
+                logEvery("nocapcurve", 10000L) {
+                    "$TAG: panel ratio curve unavailable, using app cap=" + f2(ratioCap())
+                }
+            }
+            val curve = if (cap >= 1e6f) ratioCap() else cap
+            val target = minOf(maxNit, base * curve)
             if (target <= base * RATIO_DONE) {
                 logEvery("noboost", 5000L) {
                     "$TAG: already at panel max, skip (nit=" + f2(base) + " max=" + maxNit + ")"
@@ -1023,9 +1039,16 @@ object HdrBoostHook {
 
         aospDev = param.thisObject
         aospState = st
-        // 只在「没有 HDR」时记录用户亮度：HDR 期间 args[2] 也可能被系统改动，
-        // 拿它当回落目标会导致退出 HDR 后亮度回错（实测出现过 0.0）。
-        if (!hdrOn && sdr.isFinite() && sdr > 0.001f) aospSdr = sdr
+        // args[2] 我们从不改写，它始终是系统给的 SDR 亮度，可以一直记录。
+        // （之前只在 !hdrOn 时记录，导致 HDR 期间用户调亮度后，退出会跳回旧值。）
+        if (sdr.isFinite() && sdr > 0.001f) {
+            if (hdrOn && Math.abs(sdr - aospSdr) > 0.01f) {
+                logEvery("sdrchg", 2000L) {
+                    "$TAG: user sdr changed during HDR " + f2(aospSdr) + " -> " + f2(sdr)
+                }
+            }
+            aospSdr = sdr
+        }
 
         if (!aospFunnelSeen) {
             aospFunnelSeen = true
@@ -1050,8 +1073,9 @@ object HdrBoostHook {
         }
         if (!aospMode || !enabled() || !hdrOn) return
 
-        // 专项链路：亮度完全交给 DPC（它按我们替换的曲线算 HDR 目标亮度），这里只观测
-        if (specificMode) {
+        // 曲线已装上（含通用链路）时：亮度完全交给 DPC。
+        // 直写 args[1] 是硬跳变，没有 ramp；DPC 自己算出来的目标会走 BrightnessRamp 渐变，丝滑得多。
+        if (splineInstalled) {
             logEvery("specgate", 3000L) {
                 var sc = "?"
                 try {
@@ -1070,9 +1094,13 @@ object HdrBoostHook {
         // 这样 SDR 白点不动、比值被曲线封顶，行为与旧模块改 XML 完全一致。
         val sdrNits = nitsOf(sdrEff)
         val ratio = splineRatio(sdrNits)
+        // 曲线不可用时「不提亮」，而不是拉满 —— 拉满会让物理比值飙到几十（刺眼+发烫）
         val target = brightnessOfNits(sdrNits * ratio).let {
             if (it.isNaN() || it <= 0f) {
-                if (b > 1.5f) absMaxBrightness() else 1.0f   // 面板曲线不可用时的退路
+                logEvery("curvefail", 5000L) {
+                    "$TAG: brightness curve unavailable, boost skipped (sdrNits=" + f2(sdrNits) + ")"
+                }
+                sdrEff
             } else {
                 Math.min(it, if (b > 1.5f) absMaxBrightness() else 1.0f)
             }
@@ -1097,8 +1125,10 @@ object HdrBoostHook {
      */
     private fun pushAospBrightness(boost: Boolean) {
         if (!aospMode) return
-        // 专项链路：不推亮度，DPC 会按替换后的曲线自己算
-        if (specificMode) return
+        // 开关关掉后绝不能继续推亮度（这里是自己塞 callArgs[1]，不经过 before-hook 的 enabled 检查）
+        if (!enabled()) return
+        // 曲线已装上：亮度交给 DPC 自己算，避免硬跳变（无 ramp）
+        if (specificMode || splineInstalled) return
         val dev = aospDev
         if (dev == null) {
             logEvery("aospnodev", 5000L) {
@@ -1123,8 +1153,12 @@ object HdrBoostHook {
             val curve = splineRatio(sdrNits)
             val t = brightnessOfNits(sdrNits * curve)
             when {
-                t.isNaN() || t <= 0f ->
-                    if (absMaxBrightness() > 1.5f) absMaxBrightness() else 1.0f
+                t.isNaN() || t <= 0f -> {
+                    logEvery("curvefail2", 5000L) {
+                        "$TAG: push curve unavailable, fallback to sdr (no boost)"
+                    }
+                    sdr
+                }
                 t > 1.0f -> 1.0f
                 else -> t
             }
@@ -1144,6 +1178,11 @@ object HdrBoostHook {
                 "$TAG: aosp push skipped: display not ON (state=" + st + ")"
             }
             return
+        }
+        val root = try {
+            XposedHelpers.callMethod(dev, "getSyncRoot")
+        } catch (_: Throwable) {
+            null
         }
         val task = Runnable {
             try {
@@ -1165,28 +1204,48 @@ object HdrBoostHook {
                 callArgs[0] = st
                 callArgs[1] = target
                 callArgs[2] = sdr
-                val runnable = m.invoke(dev, *callArgs) as? Runnable
-                if (runnable == null) {
-                    // 没有产生 Runnable = 系统认为没变化，说明上一次已经推到位
-                    logEvery("aospnoop", 5000L) {
-                        "$TAG: aosp push no-op (already " + f2(target) + ")"
+                // 系统自己的 handleHdrSdrNitsChanged 都是 synchronized(getSyncRoot())。
+                // 我们不持锁直接调 requestDisplayStateLocked，会和 PhotonicModulator 抢
+                // mState/mBrightnessState，导致 run() 用旧值回写 -> 退出 HDR 时亮度不回落。
+                val exec = {
+                    val runnable = m.invoke(dev, *callArgs) as? Runnable
+                    if (runnable == null) {
+                        // 没有产生 Runnable = 系统认为没变化，说明上一次已经推到位
+                        logEvery("aospnoop", 5000L) {
+                            "$TAG: aosp push no-op (already " + f2(target) + ")"
+                        }
+                    } else {
+                        runnable.run()
+                        logEvery("aosppushok", 1000L) {
+                            "$TAG: aosp push applied brightness=" + f2(target) +
+                                " sdr=" + f2(sdr) + " state=" + st
+                        }
                     }
-                    return@Runnable
                 }
-                runnable.run()
-                logEvery("aosppushok", 1000L) {
-                    "$TAG: aosp push applied brightness=" + f2(target) +
-                        " sdr=" + f2(sdr) + " state=" + st
+                if (root != null) {
+                    synchronized(root) { exec() }
+                } else {
+                    logEvery("nosyncroot", 30000L) {
+                        "$TAG: getSyncRoot unavailable, pushing brightness WITHOUT device lock"
+                    }
+                    exec()
                 }
             } catch (t: Throwable) {
                 logEvery("aosppushfail", 3000L) { "$TAG: aosp push failed: " + t }
             }
         }
+        val h = dpcHandler
+        if (h == null) {
+            // 在 watcher 线程直接跑 updatePowerState/requestDisplayStateLocked 会破坏 DPC 状态
+            logEvery("nohandler", 30000L) {
+                "$TAG: DPC handler missing, refuse to push brightness off-thread"
+            }
+            return
+        }
         try {
-            val h = dpcHandler
-            if (h != null) h.post(task) else task.run()
-        } catch (_: Throwable) {
-            task.run()
+            h.post(task)
+        } catch (t: Throwable) {
+            logEvery("postfail", 30000L) { "$TAG: post to DPC handler failed: " + t }
         }
     }
 
@@ -1280,6 +1339,26 @@ object HdrBoostHook {
     @Volatile private var lastForceAt = 0L
     /** 两次 display-changed 之间的最小间隔（ms）。MIUI 桌面收到密集事件会 NPE 崩溃 */
     private const val FORCE_MIN_INTERVAL_MS = 500L
+    /** 被节流丢弃的「最新比值」，节流窗口结束时补写一次，否则 ramp 末值会永久丢失 */
+    @Volatile private var pendingRatio = Float.NaN
+    /** 系统最近一次把 mCurrentHdrSdrRatio 写成 NaN 的时间（P0-3：兜底判据用） */
+    @Volatile private var sysRatioNaNSince = 0L
+
+    private val trailHandler: android.os.Handler by lazy {
+        android.os.Handler(android.os.Looper.getMainLooper())
+    }
+
+    /** 节流补写：把被丢弃的最后一个比值补上 */
+    private val trailRunnable = Runnable {
+        val p = pendingRatio
+        pendingRatio = Float.NaN
+        if (!p.isNaN()) {
+            lastForceAt = android.os.SystemClock.elapsedRealtime()
+            lastForcedRatio = p
+            forceHdrSdrRatio(p)
+            logEvery("trail", 3000L) { "$TAG: ratio trailing write " + f2(p) }
+        }
+    }
 
     private fun pushRatioDirect(inner: Any, args: Array<Any?>) {
         if (!aospMode || !enabled()) return
@@ -1294,12 +1373,16 @@ object HdrBoostHook {
                     ?.also { it.isAccessible = true }
                 ratioApply = cls.declaredMethods.firstOrNull { it.name == "handleHdrSdrNitsChanged" }
                     ?.also { it.isAccessible = true }
-                ratioResolved = true
-                XposedBridge.log(
-                    "$TAG: ratio direct ready (brightnessToBacklight=" + (ratioB2B != null) +
-                        " backlightToNits=" + (ratioB2N != null) +
-                        " handleHdrSdrNitsChanged=" + (ratioApply != null) + ")"
-                )
+                if (ratioB2B != null && ratioB2N != null && ratioApply != null) {
+                    ratioResolved = true
+                    XposedBridge.log("$TAG: ratio direct ready (all 3 methods resolved)")
+                } else {
+                    logEvery("rationotready", 30000L) {
+                        "$TAG: ratio direct NOT ready on " + inner.javaClass.name +
+                            " (b2b=" + (ratioB2B != null) + " b2n=" + (ratioB2N != null) +
+                            " apply=" + (ratioApply != null) + ")"
+                    }
+                }
             }
             val b2b = ratioB2B
             val b2n = ratioB2N
@@ -1312,7 +1395,9 @@ object HdrBoostHook {
             val sdrBacklight = b2b.invoke(inner, sdr) as? Float ?: return
             val nits = b2n.invoke(inner, backlight) as? Float ?: return
             val sdrNits = b2n.invoke(inner, sdrBacklight) as? Float ?: return
-            apply.invoke(inner, nits, sdrNits)
+            // 注意：apply.invoke 内部会 updateDeviceInfoLocked -> sendDisplayDeviceEventLocked，
+            // 也就是一次 display-changed。它必须和 forceHdrSdrRatio 一样受节流约束，
+            // 否则 mUseSurfaceControlBrightness=true 的机型上仍会每帧发一次事件。
             // 系统内部还有两道我们绕不开的条件：
             //   handleHdrSdrNitsChanged 里要求 (mUseSurfaceControlBrightness || mForceSurfaceControl)，
             //   小米还额外要求 mSupportUltraHDR（旧模块就是靠反编译删掉这一条）。
@@ -1334,17 +1419,34 @@ object HdrBoostHook {
             //    只靠 ① 仍会形成每帧一次的 display-changed 风暴（MIUI 桌面会崩）。
             val changed = last.isNaN() || Math.abs(ratio - last) > 0.05f
             val cooled = now - lastForceAt >= FORCE_MIN_INTERVAL_MS
-            // 专项链路：系统自己算，我们只在它算不出（NaN/0）时兜底
+            // 专项链路：系统自己算，我们只在它「算不出」时兜底。
+            // 注意不能只看 currentHdrSdrRatio().isNaN() —— hookRatioNeverNaN 会把 NaN 归一成 1.0，
+            // 那样就永远判不出「系统没算」。所以用「最近 1.5s 内系统写过 NaN」作为判据。
             val needFallback = if (specificMode) {
-                val sys = currentHdrSdrRatio()
-                sys.isNaN() || sys <= 0f
+                (now - sysRatioNaNSince) < 1500L ||
+                    currentHdrSdrRatio().let { it.isNaN() || it <= 0f }
             } else {
                 true
             }
-            if (needFallback && changed && cooled) {
-                lastForceAt = now
-                lastForcedRatio = ratio
-                forceHdrSdrRatio(ratio)
+            when {
+                !needFallback -> Unit                      // 系统自己给了，不干预
+                !changed -> Unit                           // 没变化，不写
+                cooled -> {
+                    // 先让系统自己走一遍（保留 notifyBacklightAnimFinished 等副作用），再兜底写字段
+                    try {
+                        apply.invoke(inner, nits, sdrNits)
+                    } catch (_: Throwable) {
+                    }
+                    lastForceAt = now
+                    lastForcedRatio = ratio
+                    forceHdrSdrRatio(ratio)
+                }
+                else -> {
+                    // 被节流：记下最新值，窗口结束时补写，避免 ramp 末值被永久丢掉（P0-1）
+                    pendingRatio = ratio
+                    trailHandler.removeCallbacks(trailRunnable)
+                    trailHandler.postDelayed(trailRunnable, FORCE_MIN_INTERVAL_MS)
+                }
             }
             logEvery("ratio2", 2000L) {
                 "$TAG: ratio direct nits=" + f2(nits) + " sdrNits=" + f2(sdrNits) +
@@ -1561,6 +1663,7 @@ object HdrBoostHook {
                 splineType.classLoader, arrayOf(splineType), handler
             )
             fld.set(cfg, proxy)
+            splineProxy = proxy
             splineInstalled = true
             XposedBridge.log(
                 "$TAG: specific chain ① sdrHdrRatioSpline replaced (cap=" + f2(ratioCap()) + ")"
@@ -1589,8 +1692,38 @@ object HdrBoostHook {
         false
     }
 
+    @Volatile private var splineProxy: Any? = null
+    @Volatile private var lastModeCheckAt = 0L
+
     private fun updateSpecificMode() {
         specificMode = splineInstalled && ultraHdrForced
+    }
+
+    /**
+     * 周期性自检，解决两个「永久卡死」：
+     *  ① DPC 早于 LocalDisplayAdapter 构造 -> updateSpecificMode 只算一次会永久 GENERIC
+     *  ② DisplayDeviceConfig 重新加载把 spline 换回原厂对象 -> 永久 SPECIFIC 但完全不提亮
+     */
+    private fun refreshSpecificMode() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastModeCheckAt < 3000L) return
+        lastModeCheckAt = now
+        if (!ultraHdrForced) updateSpecificMode()
+        val cfg = displayConfig
+        if (cfg != null && splineInstalled) {
+            try {
+                val fld = cfg.javaClass.getDeclaredField("mSdrToHdrRatioSpline")
+                fld.isAccessible = true
+                if (fld.get(cfg) !== splineProxy) {
+                    splineInstalled = false
+                    XposedBridge.log("$TAG: sdrHdrRatioSpline was replaced by system -> reinstall")
+                    installSpecificSpline()
+                }
+            } catch (t: Throwable) {
+                logEvery("splinecheck", 60000L) { "$TAG: spline check failed: " + t }
+            }
+        }
+        updateSpecificMode()
     }
 
     // ── AOSP HBM 通路（补「配置法」的缺口）─────────────────────
@@ -1746,13 +1879,34 @@ object HdrBoostHook {
         val cls = XposedHelpers.findClass(
             "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice", classLoader
         )
+        // ① updateDeviceInfoLocked(before)：把字段本身归一，后续 mInfo 拷贝自然是 1.0
         hookAll(cls, "updateDeviceInfoLocked", object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 try {
                     val r = XposedHelpers.getFloatField(param.thisObject, "mCurrentHdrSdrRatio")
                     if (r.isNaN()) {
+                        sysRatioNaNSince = android.os.SystemClock.elapsedRealtime()
                         XposedHelpers.setFloatField(param.thisObject, "mCurrentHdrSdrRatio", 1.0f)
                     }
+                } catch (_: Throwable) {
+                }
+            }
+        })
+        // ② getDisplayDeviceInfoLocked(after)：DisplayInfo.hdrSdrRatio 的真正拷贝点。
+        //    某些机型在首次 HDR 之前 updateDeviceInfoLocked 一次都不会被调用，
+        //    只挂 ① 的话 NaN 归一化永远不执行 -> Display.isHdrSdrRatioAvailable() 恒 false
+        //    -> 验收 App 不订阅监听。这里兜住所有读取路径。
+        hookAll(cls, "getDisplayDeviceInfoLocked", object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    val r = XposedHelpers.getFloatField(param.thisObject, "mCurrentHdrSdrRatio")
+                    if (r.isNaN()) {
+                        sysRatioNaNSince = android.os.SystemClock.elapsedRealtime()
+                        XposedHelpers.setFloatField(param.thisObject, "mCurrentHdrSdrRatio", 1.0f)
+                    }
+                    val info = param.result ?: return
+                    val iv = XposedHelpers.getFloatField(info, "hdrSdrRatio")
+                    if (iv.isNaN()) XposedHelpers.setFloatField(info, "hdrSdrRatio", 1.0f)
                 } catch (_: Throwable) {
                 }
             }
@@ -1925,9 +2079,13 @@ object HdrBoostHook {
         val cached = hdrMetaCache
         if (cached != null && now - hdrMetaAt < 2000L) return cached
         val v = querySfLayerHdr()
+        // 无论成功失败都要刷新时间：失败时若不刷新，会退化成每 400ms 一次「新线程 + 全量 SF dump」，
+        // 而 binder.dump 是同步的，reader.join(1500) 会把 watcher 线程阻塞住。
+        hdrMetaAt = now
         if (v != null) {
             hdrMetaCache = v
-            hdrMetaAt = now
+        } else {
+            logEvery("sffail", 30000L) { "$TAG: SF layer dump failed (HDR evidence unavailable)" }
         }
         return v ?: cached
     }
@@ -1985,7 +2143,10 @@ object HdrBoostHook {
     /** 事件驱动：一旦有媒体会话/窗口变化，立刻重算一次，不等下一轮轮询 */
     @Volatile private var recheckAt = 0L
     private fun recheckNow() {
-        recheckAt = android.os.SystemClock.elapsedRealtime()
+        val now = android.os.SystemClock.elapsedRealtime()
+        // UI 动画期间 relayout 每秒几十次，不节流会把 2s 的 SF 缓存打穿成每轮一次全量 dump
+        if (now - recheckAt < 800L) return
+        recheckAt = now
         hdrMetaCache = null // 失效缓存，强制重查
     }
 
@@ -2118,6 +2279,22 @@ object HdrBoostHook {
         Thread {
             while (true) {
                 try {
+                    // ① 链路自检：DPC/Adapter 构造顺序、或系统把 spline 换回去时，都要能自愈
+                    refreshSpecificMode()
+                    // ② 退出 HDR 后的收尾：gateUntil 只是「允许继续写」的窗口，
+                    //    如果退出时没有产生任何亮度事件，比值会永远停在旧值。
+                    //    这里在窗口到期时主动把比值归 1.0（归零不算干预亮度）。
+                    val nowTail = android.os.SystemClock.elapsedRealtime()
+                    if (!hdrOn && gateUntil != 0L && nowTail >= gateUntil) {
+                        gateUntil = 0L
+                        val cur = currentHdrSdrRatio().let { if (it.isNaN()) 1f else it }
+                        if (Math.abs(cur - 1f) > 0.05f) {
+                            lastForcedRatio = 1.0f
+                            lastForceAt = nowTail
+                            forceHdrSdrRatio(1.0f)
+                            XposedBridge.log("$TAG: ratio tail-restore 1.0 (was " + f2(cur) + ")")
+                        }
+                    }
                     // 三条信号：① 焦点窗口 colorMode ② 视频播放中 ③ 兜底（relayout 集合 / SF）
                     val focus = focusedWindowHdr()
                     val video = videoPlaying()
@@ -2189,7 +2366,9 @@ object HdrBoostHook {
                             }
                         }
                     }
-                } catch (_: Throwable) {
+                } catch (t: Throwable) {
+                    // 不能静默：这里一旦持续异常，hdrOn 永远不翻转，日志里却只剩 "watcher started"
+                    logEvery("watchfail", 5000L) { "$TAG: watcher loop failed: " + t }
                 }
                 try {
                     Thread.sleep(POLL_MS)
