@@ -959,6 +959,16 @@ object HdrBoostHook {
     private val brightnessHook = object : XC_MethodHook() {
         override fun beforeHookedMethod(param: MethodHookParam) {
             if (!aospMode || !enabled() || !hdrOn) return
+            // ★ 关键守卫：曲线装上后亮度必须完全交给 DPC。
+            //   这里是「第二条硬推路径」——它作用在 $1.setDisplayBrightness 上，
+            //   即使 DPC 已经算出正确的 HDR 目标亮度，也会被这里改写成面板最大，
+            //   于是 nits 恒 650、比值恒被 cap 钉死，且退出 HDR 后没人把亮度改回来。
+            if (specOn() || splineInstalled) {
+                logEvery("specnoBoost", 5000L) {
+                    "$TAG: setDisplayBrightness boost skipped (system-driven chain)"
+                }
+                return
+            }
             val args = param.args
             if (args.size < 2) return
             val sdr = args[1] as? Float ?: return
@@ -1839,7 +1849,15 @@ object HdrBoostHook {
                 logEvery("splinecheck", 60000L) { "$TAG: spline check failed: " + t }
             }
         }
+        val before = specificMode
         updateSpecificMode()
+        if (before != specificMode) {
+            XposedBridge.log(
+                "$TAG: chain -> " + (if (specificMode) "SPECIFIC(系统自算)" else "GENERIC(模块代劳)") +
+                    " [spline=" + splineInstalled + " ultraHdr=" + ultraHdrForced +
+                    " force=" + forceSurfaceControlSet + "]"
+            )
+        }
     }
 
     // ── AOSP HBM 通路（补「配置法」的缺口）─────────────────────
