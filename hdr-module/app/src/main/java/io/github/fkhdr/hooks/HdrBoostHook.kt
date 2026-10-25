@@ -204,8 +204,10 @@ object HdrBoostHook {
         aospMode = platform == PLAT_AOSP || forceAosp || oppoPathDead
         if (aospMode) {
             specificOnlyChain = specificChainPossible(classLoader)
-            steps.append(" force=").append(hookForceSurfaceControl(classLoader))
-            steps.append(" spec=").append(hookLocalDisplayAdapterForSpecific(classLoader))
+            // ★ 不再写 mSupportUltraHDR / mForceSurfaceControl：
+            //   后者会把亮度输出切到 SurfaceControl 通路，本机不支持 -> 屏幕点不亮（已实测）。
+            //   改为直接接管 handleHdrSdrNitsChanged，等价于旧模块删掉门禁代码。
+            steps.append(" bypass=").append(hookAospRatioBypass(classLoader))
             if (!specificOnlyChain) {
                 // 补偿链路：只有开不出门禁的 ROM 才需要
                 steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
@@ -1684,6 +1686,98 @@ object HdrBoostHook {
     @Volatile private var ultraHdrForced = false
 
     /** ① 替换面板的 sdr->hdr 比值曲线（等效旧模块改 XML） */
+    /** 取显示设备的同步根：getSyncRoot() 在 DisplayAdapter 上，不在 device 上 */
+    private fun syncRootOf(dev: Any): Any? {
+        try {
+            val adapter = XposedHelpers.getObjectField(dev, "this" + D + "0")
+            return XposedHelpers.callMethod(adapter, "getSyncRoot")
+        } catch (_: Throwable) {
+        }
+        try {
+            val adapter = XposedHelpers.getObjectField(dev, "this" + D + "0")
+            return XposedHelpers.getObjectField(adapter, "mSyncRoot")
+        } catch (_: Throwable) {
+        }
+        return null
+    }
+
+    /**
+     * ★ 核心：接管 handleHdrSdrNitsChanged，用 AOSP 原版逻辑替换掉带厂商门禁的实现。
+     *
+     * 这正是旧模块「反编译删掉三道门禁」的运行时等价物：
+     *   AOSP 原版：
+     *       if (displayNits != -1 && sdrNits != -1) ratio = max(1, nits/sdrNits);
+     *       else                                     ratio = NaN;
+     *       if (!floatEquals(mCurrentHdrSdrRatio, ratio)) {
+     *           synchronized (getSyncRoot()) { mCurrentHdrSdrRatio = ratio; updateDeviceInfoLocked(); }
+     *       }
+     *   厂商版：上面还要 (mUseSurfaceControlBrightness || mForceSurfaceControl) && mSupportUltraHDR
+     *
+     * 关键：**绝不改任何标志位**。之前把 mForceSurfaceControl 置 true 会把亮度输出
+     * 从 sysfs 背光通路切到 SurfaceControl 通路，本机不支持 → 屏幕点不亮。
+     * 这里只接管这一个方法，完全不碰亮度通路。
+     */
+    private fun hookAospRatioBypass(classLoader: ClassLoader): Int = try {
+        val cls = XposedHelpers.findClass(
+            "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice" + D + "1",
+            classLoader
+        )
+        val n = hookAll(cls, "handleHdrSdrNitsChanged", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                if (!aospMode || !enabled()) return
+                val nits = param.args.getOrNull(0) as? Float ?: return
+                val sdrNits = param.args.getOrNull(1) as? Float ?: return
+                // AOSP 原版判定
+                val raw = if (nits != -1f && sdrNits != -1f) Math.max(1f, nits / sdrNits) else Float.NaN
+                val ratio = if (raw.isNaN()) 1f else Math.min(raw, ratioCap())
+                val dev = try {
+                    XposedHelpers.getObjectField(param.thisObject, "this" + D + "1")
+                } catch (_: Throwable) {
+                    null
+                } ?: return
+                // 与 AOSP 一致：只有真的变化才写，避免 display-changed 风暴
+                val cur = try {
+                    XposedHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
+                } catch (_: Throwable) {
+                    Float.NaN
+                }
+                if (!cur.isNaN() && Math.abs(cur - ratio) < 0.01f) {
+                    param.result = null   // 值没变，跳过原方法
+                    return
+                }
+                val job = Runnable {
+                    try {
+                        XposedHelpers.setFloatField(dev, "mCurrentHdrSdrRatio", ratio)
+                        XposedHelpers.callMethod(dev, "updateDeviceInfoLocked")
+                    } catch (t: Throwable) {
+                        logEvery("bypasswrite", 10000L) { "$TAG: ratio write failed: " + t }
+                    }
+                }
+                // getSyncRoot() 定义在 DisplayAdapter 上（不是 device），
+                // 之前直接对 device 调 -> 一直拿不到 -> 无锁写 -> 与显示线程竞态。
+                val root = syncRootOf(dev)
+                if (root != null) {
+                    synchronized(root) { job.run() }
+                } else {
+                    logEvery("noroot", 30000L) {
+                        "$TAG: sync root unavailable, ratio write WITHOUT lock"
+                    }
+                    job.run()
+                }
+                param.result = null       // 跳过带厂商门禁的原方法
+                logEvery("bypass", 2000L) {
+                    "$TAG: ratio bypass nits=" + f2(nits) + " sdrNits=" + f2(sdrNits) +
+                        " -> " + f2(ratio)
+                }
+            }
+        })
+        if (n > 0) ratioBypassInstalled = true
+        n
+    } catch (t: Throwable) {
+        logEvery("bypasshook", 60000L) { "$TAG: ratio bypass hook failed: " + t.message }
+        0
+    }
+
     /**
      * 只读诊断：打印 handleHdrSdrNitsChanged 的真实入参与门禁状态。
      * 不改任何行为，纯粹为了「比值为什么是 1」能一眼看出来。
@@ -1800,6 +1894,7 @@ object HdrBoostHook {
      * HBM 强制 / 状态机 watcher —— 挂不上的钩子永远不会有多余行为。
      */
     @Volatile private var specificOnlyChain = false
+    @Volatile private var ratioBypassInstalled = false
 
     private fun hasField(c: Class<*>, name: String): Boolean = findFieldUp(c, name) != null
 
@@ -1827,20 +1922,21 @@ object HdrBoostHook {
     }
 
     private fun specificChainPossible(cl: ClassLoader): Boolean = try {
-        val adapter = XposedHelpers.findClass("com.android.server.display.LocalDisplayAdapter", cl)
-        val backlight = XposedHelpers.findClass(
-            "com.android.server.display.LocalDisplayAdapter" + D + "BacklightAdapter", cl
+        val inner = XposedHelpers.findClass(
+            "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice" + D + "1", cl
         )
         val cfg = XposedHelpers.findClass("com.android.server.display.DisplayDeviceConfig", cl)
-        val ok = hasField(adapter, "mSupportUltraHDR") &&
-            hasMethod(backlight, "setForceSurfaceControl", java.lang.Boolean.TYPE) &&
-            hasField(cfg, "mSdrToHdrRatioSpline")
+        // 只要「能替换曲线」且「能接管比值计算」就够。
+        // 不再依赖 mSupportUltraHDR / mForceSurfaceControl —— 改那些标志会切亮度通路，
+        // 本机不支持 SurfaceControl 亮度，置 true 会导致屏幕点不亮。
+        val ok = hasField(cfg, "mSdrToHdrRatioSpline") &&
+            hasMethod(inner, "handleHdrSdrNitsChanged", java.lang.Float.TYPE, java.lang.Float.TYPE)
         XposedBridge.log(
             "$TAG: specific-chain probe -> " + ok +
-                " [mSupportUltraHDR=" + hasField(adapter, "mSupportUltraHDR") +
-                " setForceSurfaceControl=" +
-                hasMethod(backlight, "setForceSurfaceControl", java.lang.Boolean.TYPE) +
-                " mSdrToHdrRatioSpline=" + hasField(cfg, "mSdrToHdrRatioSpline") + "]"
+                " [mSdrToHdrRatioSpline=" + hasField(cfg, "mSdrToHdrRatioSpline") +
+                " handleHdrSdrNitsChanged=" +
+                hasMethod(inner, "handleHdrSdrNitsChanged", java.lang.Float.TYPE, java.lang.Float.TYPE) +
+                "]"
         )
         ok
     } catch (t: Throwable) {
@@ -1959,8 +2055,8 @@ object HdrBoostHook {
     @Volatile private var hdrOnSince = 0L
 
     private fun updateSpecificMode() {
-        // 三个条件都满足 = 厂商加的门禁已被完全打开 = 设备行为回到 AOSP
-        specificMode = splineInstalled && ultraHdrForced && forceSurfaceControlSet
+        // 曲线已替换 + 比值计算已被接管 = 设备行为回到 AOSP
+        specificMode = splineInstalled && ratioBypassInstalled
     }
 
     @Volatile private var wdCache = false
@@ -2206,25 +2302,13 @@ object HdrBoostHook {
                 }
             }
         })
-        // ② getDisplayDeviceInfoLocked(after)：DisplayInfo.hdrSdrRatio 的真正拷贝点。
-        //    某些机型在首次 HDR 之前 updateDeviceInfoLocked 一次都不会被调用，
-        //    只挂 ① 的话 NaN 归一化永远不执行 -> Display.isHdrSdrRatioAvailable() 恒 false
-        //    -> 验收 App 不订阅监听。这里兜住所有读取路径。
-        hookAll(cls, "getDisplayDeviceInfoLocked", object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                try {
-                    val r = XposedHelpers.getFloatField(param.thisObject, "mCurrentHdrSdrRatio")
-                    if (r.isNaN()) {
-                        sysRatioNaNSince = android.os.SystemClock.elapsedRealtime()
-                        XposedHelpers.setFloatField(param.thisObject, "mCurrentHdrSdrRatio", 1.0f)
-                    }
-                    val info = param.result ?: return
-                    val iv = XposedHelpers.getFloatField(info, "hdrSdrRatio")
-                    if (iv.isNaN()) XposedHelpers.setFloatField(info, "hdrSdrRatio", 1.0f)
-                } catch (_: Throwable) {
-                }
-            }
-        })
+        // ② 原先还挂了 getDisplayDeviceInfoLocked(after) 做 NaN 归一。
+        //    但它在 system_server 崩溃栈里出现过：
+        //      ArrayIndexOutOfBoundsException at getDisplayDeviceInfoLocked(LocalDisplayAdapter.java:725)
+        //      at ...CaimpCramng.getDisplayDeviceInfoLocked  ← 我们的钩子
+        //      at DisplayDeviceRepository.handleDisplayDeviceChanged
+        //    现在比值由 hookAospRatioBypass 在每次 setDisplayBrightness 时写入，
+        //    mCurrentHdrSdrRatio 不再是 NaN，这个钩子已无必要，移除以消除崩溃面。
     } catch (t: Throwable) {
         logEvery("nanfix", 60000L) { "$TAG: ratio-never-NaN hook failed: " + t.message }
         0
