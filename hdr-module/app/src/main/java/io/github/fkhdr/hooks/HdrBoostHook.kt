@@ -212,6 +212,7 @@ object HdrBoostHook {
         // DisplayInfo 伪装也放通用段：patchDisplayInfo 自带守卫（已含 11/12 就原样返回），
         // 真 HDR 机型不会被改动；缺 HDR 色彩模式的机型（本机）才会被补上。
         steps.append(" forge=").append(hookDisplayInfoForgery(classLoader))
+        steps.append(" nan=").append(hookRatioNeverNaN(classLoader))
         steps.append(" dpc=").append(hookDisplayPowerController(classLoader))
         steps.append(" media=").append(hookMediaSessions(classLoader))
         steps.append(" wms=").append(hookWindowManager(classLoader))
@@ -310,7 +311,9 @@ object HdrBoostHook {
     /** 原生路径用的倍率：受面板曲线上限约束 */
     private fun nativeFactor(): Float = minOf(factor(), lastRatioCap)
 
-    private fun f2(v: Float): String = (Math.round(v * 100f) / 100f).toString()
+    // 注意 Math.round(NaN) == 0，旧写法会把 NaN 打成 "0.0"，排查时会误判成「被写成 0」
+    private fun f2(v: Float): String =
+        if (v.isNaN()) "NaN" else (Math.round(v * 100f) / 100f).toString()
 
     // ── 工具：安全 hook + 安全读写字段 ───────────────────────
     /** 返回该名字实际挂上多少个方法（0 = 这个版本里没有该方法） */
@@ -1023,7 +1026,13 @@ object HdrBoostHook {
             var sc = "?"
             try {
                 val ba = XposedHelpers.getObjectField(param.thisObject, "mBacklightAdapter")
-                sc = XposedHelpers.getBooleanField(ba, "mUseSurfaceControlBrightness").toString()
+                val use = XposedHelpers.getBooleanField(ba, "mUseSurfaceControlBrightness")
+                val force = try {
+                    XposedHelpers.getBooleanField(ba, "mForceSurfaceControl")
+                } catch (_: Throwable) {
+                    false
+                }
+                sc = "use=" + use + " force=" + force
             } catch (_: Throwable) {
             }
             XposedBridge.log(
@@ -1217,6 +1226,8 @@ object HdrBoostHook {
     @Volatile private var ratioB2N: java.lang.reflect.Method? = null
     @Volatile private var ratioApply: java.lang.reflect.Method? = null
     @Volatile private var ratioResolved = false
+    /** 上次真正写入的比值；用来把 display-changed 事件降到只在比值变化时发一次 */
+    @Volatile private var lastForcedRatio = Float.NaN
 
     private fun pushRatioDirect(inner: Any, args: Array<Any?>) {
         if (!aospMode || !enabled()) return
@@ -1257,10 +1268,18 @@ object HdrBoostHook {
             // 所以这里再补一步：直接把 mCurrentHdrSdrRatio 写进 LocalDisplayDevice 并刷新 DeviceInfo，
             // 与任何内部条件无关。App 最终读到的就是这个值。
             val ratio = if (sdrNits > 0f) Math.max(1f, nits / sdrNits) else 1f
-            forceHdrSdrRatio(inner, ratio)
+            // 只在比值「真的变了」才写。
+            // 每次写都会走 updateDeviceInfoLocked -> sendDisplayDeviceEventLocked ->
+            // 所有应用收到 onDisplayChanged；实测 MIUI 桌面（com.miui.home）会在
+            // DeviceHelper.isCarWithScreen 抛 NPE 崩掉。所以必须把事件降到最低频。
+            val last = lastForcedRatio
+            if (last.isNaN() || Math.abs(ratio - last) > 0.05f) {
+                lastForcedRatio = ratio
+                forceHdrSdrRatio(ratio)
+            }
             logEvery("ratio2", 2000L) {
                 "$TAG: ratio direct nits=" + f2(nits) + " sdrNits=" + f2(sdrNits) +
-                    " -> ratio=" + f2(ratio) + " current=" + f2(currentHdrSdrRatio(inner))
+                    " -> ratio=" + f2(ratio) + " current=" + f2(currentHdrSdrRatio())
             }
         } catch (t: Throwable) {
             logEvery("ratiofail", 10000L) { "$TAG: ratio direct failed: " + t }
@@ -1276,20 +1295,42 @@ object HdrBoostHook {
      *   ③ 小米私有：LocalDisplayAdapter.mSupportUltraHDR
      * 本机 ② 就是 false，所以系统自己算出来的永远是 NaN。这里跳过它，直接写字段 + 刷新 DeviceInfo。
      */
-    private fun forceHdrSdrRatio(inner: Any, ratio: Float) {
+    private fun forceHdrSdrRatio(ratio: Float) {
         try {
-            val dev = XposedHelpers.getObjectField(inner, "this" + D + "0")
+            // 不要用 $1.this$0 取外层：匿名内部类的合成字段名在不同编译器/混淆下不一样
+            // （本机实测 NoSuchFieldError: LocalDisplayDevice$1#this$0）。
+            // aospDev 是 requestDisplayStateLocked 的 thisObject，天然就是 LocalDisplayDevice。
+            val dev = aospDev ?: run {
+                logEvery("rationodev", 10000L) { "$TAG: force ratio skipped: no LocalDisplayDevice" }
+                return
+            }
             val root = try {
                 XposedHelpers.callMethod(dev, "getSyncRoot")
             } catch (_: Throwable) {
                 null
             }
             val apply = Runnable {
+                var step = "set"
                 try {
                     XposedHelpers.setFloatField(dev, "mCurrentHdrSdrRatio", ratio)
+                    step = "updateDeviceInfo"
                     XposedHelpers.callMethod(dev, "updateDeviceInfoLocked")
+                    step = "readback"
+                    // 注意：不要再手动 sendDisplayDeviceEventLocked —— updateDeviceInfoLocked
+                    // 内部已经发过一次，重复发会让所有应用收到两次 onDisplayChanged。
+                    val info = XposedHelpers.getObjectField(dev, "mInfo")
+                    val back = XposedHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
+                    val infoBack = try {
+                        XposedHelpers.getFloatField(info, "hdrSdrRatio")
+                    } catch (_: Throwable) {
+                        Float.NaN
+                    }
+                    logEvery("ratioforceok", 3000L) {
+                        "$TAG: ratio forced " + f2(ratio) + " on " + dev.javaClass.simpleName +
+                            " (field=" + f2(back) + " info=" + f2(infoBack) + ")"
+                    }
                 } catch (t: Throwable) {
-                    logEvery("ratioforce", 10000L) { "$TAG: force ratio failed: " + t }
+                    logEvery("ratioforce", 10000L) { "$TAG: force ratio failed at " + step + ": " + t }
                 }
             }
             if (root != null) {
@@ -1303,9 +1344,9 @@ object HdrBoostHook {
     }
 
     /** 读回 LocalDisplayDevice.mCurrentHdrSdrRatio（App 最终看到的值） */
-    private fun currentHdrSdrRatio(inner: Any): Float = try {
-        val outer = XposedHelpers.getObjectField(inner, "this" + D + "0")
-        XposedHelpers.getFloatField(outer, "mCurrentHdrSdrRatio")
+    private fun currentHdrSdrRatio(): Float = try {
+        val dev = aospDev ?: return Float.NaN
+        XposedHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
     } catch (_: Throwable) {
         Float.NaN
     }
@@ -1439,6 +1480,41 @@ object HdrBoostHook {
         n
     } catch (t: Throwable) {
         logEvery("probe", 60000L) { "$TAG: ratio probe unavailable: " + t.message }
+        0
+    }
+
+    /**
+     * 让 hdrSdrRatio 永不等于 NaN（无 HDR 内容时报 1.0）。
+     *
+     * 为什么必须这么做：android.view.Display#isHdrSdrRatioAvailable() 的实现就是
+     *     return !Float.isNaN(mDisplayInfo.hdrSdrRatio);
+     * 而应用（含 HDR 能力检测 App）只有在它返回 true 时才会
+     *     display.registerHdrSdrRatioChangedListener(...)
+     * 去订阅后续变化。本机原厂路径因为 backlight adapter 不支持 SurfaceControl 亮度，
+     * handleHdrSdrNitsChanged 会把比值写成 NaN —— 于是「HDR SDR 调光支持」永远 ❌、
+     * App 永远不订阅、界面永远停在 1.0（即使我们后面真的把比值改成了 60）。
+     *
+     * 这里在每次重建 DisplayDeviceInfo 之前把 NaN 归一成 1.0：
+     *   无 HDR -> 报 1.0（支持=✔️，App 会订阅）
+     *   有 HDR -> 我们的 forceHdrSdrRatio 写入真实比值，App 通过监听器实时看到
+     */
+    private fun hookRatioNeverNaN(classLoader: ClassLoader): Int = try {
+        val cls = XposedHelpers.findClass(
+            "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice", classLoader
+        )
+        hookAll(cls, "updateDeviceInfoLocked", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                try {
+                    val r = XposedHelpers.getFloatField(param.thisObject, "mCurrentHdrSdrRatio")
+                    if (r.isNaN()) {
+                        XposedHelpers.setFloatField(param.thisObject, "mCurrentHdrSdrRatio", 1.0f)
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        })
+    } catch (t: Throwable) {
+        logEvery("nanfix", 60000L) { "$TAG: ratio-never-NaN hook failed: " + t.message }
         0
     }
 
@@ -1805,7 +1881,10 @@ object HdrBoostHook {
                         focus == true -> true
                         video -> true
                         focus == null -> hdrWindows.isNotEmpty() || sfHdrPlaying()
-                        else -> false
+                        // 兜底：窗口没设 colorMode、也没有媒体会话的播放器（很多第三方播放器都是这样），
+                        // 只要 SurfaceFlinger 里有图层带 HDR 元数据，就认为在放 HDR。
+                        // 这是最接近「事实」的信号，不依赖应用配合。
+                        else -> sfLayerHasHdrMetadata() == true || hdrWindows.isNotEmpty()
                     }
                     // 退出迟滞（仅类原生）：HDR 图片/瞬时窗口会让状态在几百毫秒内抖动，
                     // 直连面板时表现为「闪一下又回去」。熄灭前要求连续缺失 HDR_EXIT_HOLD_MS。
@@ -1819,7 +1898,11 @@ object HdrBoostHook {
                     }
                     if (want != hdrOn) {
                         hdrOn = want
-                        if (!want) gateUntil = android.os.SystemClock.elapsedRealtime() + 5000L
+                        if (!want) {
+                            gateUntil = android.os.SystemClock.elapsedRealtime() + 5000L
+                        } else {
+                            lastForcedRatio = Float.NaN
+                        }
                         val d = hdrEnhance
                         if (d != null) callPriv(d, "checkIsPlayingHDR")
                         // 原生驱动会自己 sendUpdatePowerState；没有驱动时必须自己点火

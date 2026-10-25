@@ -155,9 +155,32 @@ public class MainActivity extends Activity
 
         setContentView(root);
 
-        btnSdr.setOnClickListener(v -> playFile(SDR_PATH));
-        btnHdr.setOnClickListener(v -> playFile(HDR_PATH));
-        btnStop.setOnClickListener(v -> doStop());
+        btnSdr.setOnClickListener(v -> {
+            setWindowColorMode(0);
+            playFile(SDR_PATH);
+        });
+        btnHdr.setOnClickListener(v -> {
+            // 模拟「正常 HDR 播放器」：把窗口 colorMode 设成 HDR。
+            // 模块的焦点窗口检测靠这个信号；不设的话只能靠媒体会话/SF 图层兜底。
+            setWindowColorMode(2);
+            playFile(HDR_PATH);
+        });
+        btnStop.setOnClickListener(v -> {
+            doStop();
+            setWindowColorMode(0);
+        });
+    }
+
+    /** 设置窗口 colorMode：0=SDR，2=COLOR_MODE_HDR */
+    private void setWindowColorMode(int mode) {
+        try {
+            // Window.setColorMode(int) 是公开 API（API 26+）；
+            // LayoutParams.colorMode 在部分 SDK 上不可见，改用这个。
+            getWindow().setColorMode(mode);
+            Log.i(TAG, "window colorMode -> " + mode);
+        } catch (Throwable t) {
+            Log.w(TAG, "setWindowColorMode failed", t);
+        }
     }
 
     private Button makeButton(String text, LinearLayout parent) {
