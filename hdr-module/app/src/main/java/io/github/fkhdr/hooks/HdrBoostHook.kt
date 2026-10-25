@@ -204,6 +204,7 @@ object HdrBoostHook {
         aospMode = platform == PLAT_AOSP || forceAosp || oppoPathDead
         if (aospMode) {
             steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
+            steps.append(" spec=").append(hookLocalDisplayAdapterForSpecific(classLoader))
             steps.append(" gate=").append(hookAospRatioGate(classLoader))
             steps.append(" hbm=").append(hookHighBrightnessModeController(classLoader))
         }
@@ -738,6 +739,11 @@ object HdrBoostHook {
                     XposedBridge.log(
                         "$TAG: panel config ready [sdrToHdrSpline=" + hasRatioSpline + "]"
                     )
+                    installSpecificSpline()
+                    updateSpecificMode()
+                    XposedBridge.log(
+                        "$TAG: chain = " + (if (specificMode) "SPECIFIC(系统自算)" else "GENERIC(模块代劳)")
+                    )
                 } catch (t: Throwable) {
                     logEvery("cfg", 60000L) { "$TAG: display config unavailable: " + t.message }
                 }
@@ -1017,7 +1023,9 @@ object HdrBoostHook {
 
         aospDev = param.thisObject
         aospState = st
-        if (sdr.isFinite() && sdr > 0.001f) aospSdr = sdr
+        // 只在「没有 HDR」时记录用户亮度：HDR 期间 args[2] 也可能被系统改动，
+        // 拿它当回落目标会导致退出 HDR 后亮度回错（实测出现过 0.0）。
+        if (!hdrOn && sdr.isFinite() && sdr > 0.001f) aospSdr = sdr
 
         if (!aospFunnelSeen) {
             aospFunnelSeen = true
@@ -1041,6 +1049,21 @@ object HdrBoostHook {
             )
         }
         if (!aospMode || !enabled() || !hdrOn) return
+
+        // 专项链路：亮度完全交给 DPC（它按我们替换的曲线算 HDR 目标亮度），这里只观测
+        if (specificMode) {
+            logEvery("specgate", 3000L) {
+                var sc = "?"
+                try {
+                    val ba = XposedHelpers.getObjectField(param.thisObject, "mBacklightAdapter")
+                    sc = "use=" + XposedHelpers.getBooleanField(ba, "mUseSurfaceControlBrightness") +
+                        " force=" + XposedHelpers.getBooleanField(ba, "mForceSurfaceControl")
+                } catch (_: Throwable) {
+                }
+                "$TAG: specific gate [b=" + f2(b) + " sdr=" + f2(sdr) + " " + sc + "]"
+            }
+            return
+        }
 
         val sdrEff = if (sdr.isFinite() && sdr > 0.001f) sdr else b
         // 目标亮度 = SDR 亮度 × 上限曲线(sdrNits)，而不是硬推到面板最大。
@@ -1074,6 +1097,8 @@ object HdrBoostHook {
      */
     private fun pushAospBrightness(boost: Boolean) {
         if (!aospMode) return
+        // 专项链路：不推亮度，DPC 会按替换后的曲线自己算
+        if (specificMode) return
         val dev = aospDev
         if (dev == null) {
             logEvery("aospnodev", 5000L) {
@@ -1084,12 +1109,25 @@ object HdrBoostHook {
         val sdr = aospSdr
         if (!sdr.isFinite() || sdr <= 0.001f) {
             logEvery("aospnosdr", 5000L) {
-                "$TAG: aosp push skipped: no user sdr brightness yet"
+                "$TAG: aosp push skipped: no user sdr brightness yet (letting system recompute)"
             }
+            // 没有可信的用户亮度时，交给 DPC 自己重算，别硬推一个可能为 0 的值
+            requestPowerUpdate()
             return
         }
+        // 与被动改写保持同一套算法：目标 = SDR nits × 上限曲线，而不是硬推面板最大。
+        // 之前这里写死 1.0，导致面板被拉到顶、系统算出的 nits/sdrNits 巨大，
+        // 上报值只能靠 cap 兜底，看起来就像「比值被钉死在 5」。
         val target = if (boost) {
-            if (absMaxBrightness() > 1.5f) absMaxBrightness() else 1.0f
+            val sdrNits = nitsOf(sdr)
+            val curve = splineRatio(sdrNits)
+            val t = brightnessOfNits(sdrNits * curve)
+            when {
+                t.isNaN() || t <= 0f ->
+                    if (absMaxBrightness() > 1.5f) absMaxBrightness() else 1.0f
+                t > 1.0f -> 1.0f
+                else -> t
+            }
         } else {
             sdr
         }
@@ -1285,7 +1323,16 @@ object HdrBoostHook {
             // 所有应用收到 onDisplayChanged；实测 MIUI 桌面（com.miui.home）会在
             // DeviceHelper.isCarWithScreen 抛 NPE 崩掉。所以必须把事件降到最低频。
             val last = lastForcedRatio
-            if (last.isNaN() || Math.abs(ratio - last) > 0.05f) {
+            // 专项链路：系统自己算，我们只在它算不出（NaN）时兜底
+            if (specificMode) {
+                val sys = currentHdrSdrRatio()
+                if (!sys.isNaN() && sys > 0f) {
+                    // 系统已给出比值，不干预
+                } else if (last.isNaN() || Math.abs(ratio - last) > 0.05f) {
+                    lastForcedRatio = ratio
+                    forceHdrSdrRatio(ratio)
+                }
+            } else if (last.isNaN() || Math.abs(ratio - last) > 0.05f) {
                 lastForcedRatio = ratio
                 forceHdrSdrRatio(ratio)
             }
@@ -1465,6 +1512,77 @@ object HdrBoostHook {
         return cap + (1f - cap) * t
     }
 
+    // ══ 专项链路（复刻「改 displayconfig + 反编译 jar」的做法，但全程运行时）══
+    //
+    // 旧模块在这个系统上做的事只有两件：
+    //   ① display_id_*.xml 里 sdrHdrRatioMap：2 nits -> 5.0，650 nits -> 1.0
+    //   ② services.jar 里删掉 handleHdrSdrNitsChanged 的 "&& mSupportUltraHDR" 门禁
+    // 做完这两件事后，提亮与比值**全部由系统自己完成**，模块不再干预亮度。
+    //
+    // 我们等价实现：
+    //   ① 运行时替换 DisplayDeviceConfig.mSdrToHdrRatioSpline（同一条曲线，cap 由 App 配）
+    //   ② 把 LocalDisplayAdapter.mSupportUltraHDR 置 true（等效于删掉那个与条件）
+    //   ③ 只保留 mIsHdrLayerPresent 强制（等价于 XML 里 minimumHdrPercentOfScreen=0 的意图）
+    // 之后：DPC 用曲线算 HDR 目标亮度 -> setDisplayBrightness -> 系统自己算 nits/sdrNits。
+    // 我们不再推亮度、不再写比值，除非专项链路自检失败（才退回通用链路）。
+    @Volatile private var specificMode = false
+    @Volatile private var splineInstalled = false
+    @Volatile private var ultraHdrForced = false
+
+    /** ① 替换面板的 sdr->hdr 比值曲线（等效旧模块改 XML） */
+    private fun installSpecificSpline() {
+        if (splineInstalled) return
+        val cfg = displayConfig ?: return
+        if (!resolveCfgMethods()) return
+        try {
+            val fld = cfg.javaClass.getDeclaredField("mSdrToHdrRatioSpline")
+            fld.isAccessible = true
+            val splineType = fld.type
+            val handler = java.lang.reflect.InvocationHandler { proxy, method, args ->
+                when (method.name) {
+                    "interpolate" -> splineRatio((args?.getOrNull(0) as? Float) ?: 0f)
+                    "toString" -> "FkHDR-Spline(cap=" + f2(ratioCap()) + ")"
+                    "hashCode" -> System.identityHashCode(proxy)
+                    "equals" -> proxy === args?.getOrNull(0)
+                    else -> null
+                }
+            }
+            val proxy = java.lang.reflect.Proxy.newProxyInstance(
+                splineType.classLoader, arrayOf(splineType), handler
+            )
+            fld.set(cfg, proxy)
+            splineInstalled = true
+            XposedBridge.log(
+                "$TAG: specific chain ① sdrHdrRatioSpline replaced (cap=" + f2(ratioCap()) + ")"
+            )
+        } catch (t: Throwable) {
+            logEvery("splinefail", 60000L) { "$TAG: replace sdrHdrRatioSpline failed: " + t }
+        }
+    }
+
+    /** ② 放开 mSupportUltraHDR（等效旧模块删掉那个与条件） */
+    private fun hookLocalDisplayAdapterForSpecific(classLoader: ClassLoader): Boolean = try {
+        val cls = XposedHelpers.findClass("com.android.server.display.LocalDisplayAdapter", classLoader)
+        XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    XposedHelpers.setBooleanField(param.thisObject, "mSupportUltraHDR", true)
+                    ultraHdrForced = true
+                    XposedBridge.log("$TAG: specific chain ② mSupportUltraHDR forced true")
+                } catch (_: Throwable) {
+                }
+            }
+        })
+        true
+    } catch (t: Throwable) {
+        logEvery("uhdrfail", 60000L) { "$TAG: LocalDisplayAdapter hook failed: " + t.message }
+        false
+    }
+
+    private fun updateSpecificMode() {
+        specificMode = splineInstalled && ultraHdrForced
+    }
+
     // ── AOSP HBM 通路（补「配置法」的缺口）─────────────────────
     //
     // 小米/一加等 ROM 的 HDR 提亮最终靠 HighBrightnessModeController 进 HBM：
@@ -1502,6 +1620,8 @@ object HdrBoostHook {
     /** HDR 翻转时强制/恢复 HBM。失败只打日志，不影响主链路。 */
     private fun applyHbm(boost: Boolean) {
         if (!aospMode || !enabled() || !hbmEnabled()) return
+        // 专项链路：HBM 由系统自己的 SurfaceControlHdrLayerInfoListener 决定，模块不介入
+        if (specificMode) return
         val c = hbmCtl ?: run {
             logEvery("hbmnoctl", 10000L) { "$TAG: HBM skipped: controller not captured" }
             return
@@ -2019,12 +2139,15 @@ object HdrBoostHook {
                         }
                         val d = hdrEnhance
                         if (d != null) callPriv(d, "checkIsPlayingHDR")
-                        // 原生驱动会自己 sendUpdatePowerState；没有驱动时必须自己点火
-                        requestPowerUpdate()
-                        // 类原生：主动把面板亮度推到顶（并保留 SDR 白点），否则永远等不到亮度变化事件
-                        pushAospBrightness(want)
-                        // 类原生：强制进/出 HBM（等效于「改 displayconfig + 删 jar 门禁」那条路）
-                        applyHbm(want)
+                        // 专项链路：全部交给系统（曲线 + 门禁已就位），模块不再点火/推亮度/推 HBM
+                        if (!specificMode) {
+                            // 原生驱动会自己 sendUpdatePowerState；没有驱动时必须自己点火
+                            requestPowerUpdate()
+                            // 类原生：主动把面板亮度推到顶（并保留 SDR 白点），否则永远等不到亮度变化事件
+                            pushAospBrightness(want)
+                            // 类原生：强制进/出 HBM（等效于「改 displayconfig + 删 jar 门禁」那条路）
+                            applyHbm(want)
+                        }
                         try {
                             val h = dpcHandler
                             if (h != null) h.postDelayed({ requestPowerUpdate() }, 700L)
