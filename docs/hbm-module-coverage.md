@@ -125,3 +125,64 @@ FkHDR:HdrFix: hbm hdrLayerPresent=false -> mode=0
 ```
 
 判读：`hbm ... mode=2` 表示面板已进 HDR-HBM；`mode=0` 表示已退出。
+
+---
+
+## 5. 本机替换记录（Redmi xaga / HyperOS 3 / Android 15）
+
+**覆盖度结论：显示亮度这条链已完全覆盖**（推导，逐条对应见 §3），
+其中「配置 spline」一项由 v1.0.1 的 `HighBrightnessModeController` 通路等效实现。
+
+已执行（2026-10-25 18:13）：
+
+```bash
+# 1) 装 FkHDR v1.0.1
+adb install -r FkHDR_v1.0.1_release.apk
+
+# 2) 在 LSPosed 中启用 + 设置作用域（用 lspctl，不需要点 UI）
+su -c '/data/adb/modules/zygisk_lsposed/lspctl module enable --user=0 io.github.benbaobaoshigemi.fkhdr'
+su -c '/data/adb/modules/zygisk_lsposed/lspctl scope set --user=0 io.github.benbaobaoshigemi.fkhdr android'
+
+# 3) 禁用旧的「改配置 + 反编译 jar」模块
+su -c 'touch /data/adb/modules/hdr_sdr_ratio_fix/disable'
+```
+
+**为什么作用域只勾 `android` 就够**：本机 `SettingsProvider` 的进程就是
+`package=com.android.providers.settings process=system`（跑在 system_server 里），
+`lspctl scope add com.android.providers.settings` 会被 LSPosed 过滤掉（DB 里不落盘），
+但 `android` 作用域已经覆盖它 —— `HookInit` 在 `android` 分支里就调用了 `SettingsProviderHook.init()`。
+
+当前状态：
+
+| 项 | 值 |
+|---|---|
+| FkHDR | v1.0.1 / versionCode 2，**enabled**，scope=`android` |
+| hdr_sdr_ratio_fix | `disable` 文件已建，**下次启动生效** |
+| 重启 | **未执行** —— 旧配置此刻仍挂载着（`/product/.../display_id_*.xml` 里仍是 `hdrRatio 5.0`） |
+
+### 下次启动后应该看到
+
+```
+FkHDR:HookInit: hooking system_server
+FkHDR:HdrFix: init done [platform=aosp aosp[dev=1 bright=1] gate=1 hbm=1 ...]
+FkHDR:HdrFix: HBM controller captured
+FkHDR:HdrFix: brightness hook installed on ...LocalDisplayAdapter$LocalDisplayDevice$1 (1 method)
+```
+
+播放 HDR 时：
+
+```
+FkHDR:HdrFix: HDR -> true(...)
+FkHDR:HdrFix: aosp push applied brightness=1.0 sdr=<用户亮度> state=2
+FkHDR:HdrFix: hbm hdrLayerPresent=true -> mode=2 (2=HBM_ON_HDR)
+FkHDR:HdrFix: ratio direct nits=<面板nits> sdrNits=<SDR nits> -> ratio=<自动算出>
+```
+
+### 回滚
+
+```bash
+su -c 'rm /data/adb/modules/hdr_sdr_ratio_fix/disable'      # 恢复旧模块
+su -c '/data/adb/modules/zygisk_lsposed/lspctl module disable --user=0 io.github.benbaobaoshigemi.fkhdr'
+# 然后重启
+```
+
