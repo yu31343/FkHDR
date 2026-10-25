@@ -2147,26 +2147,27 @@ object HdrBoostHook {
                         } else {
                             lastForcedRatio = Float.NaN
                         }
+                        // 专项链路：全部交给系统（曲线 + 门禁已就位）。
+                        // 注意 700ms 的 postDelayed 也必须一起挡住，否则专项链路下仍会点火。
                         val d = hdrEnhance
-                        if (d != null) callPriv(d, "checkIsPlayingHDR")
-                        // 专项链路：全部交给系统（曲线 + 门禁已就位），模块不再点火/推亮度/推 HBM
                         if (!specificMode) {
+                            if (d != null) callPriv(d, "checkIsPlayingHDR")
                             // 原生驱动会自己 sendUpdatePowerState；没有驱动时必须自己点火
                             requestPowerUpdate()
                             // 类原生：主动把面板亮度推到顶（并保留 SDR 白点），否则永远等不到亮度变化事件
                             pushAospBrightness(want)
                             // 类原生：强制进/出 HBM（等效于「改 displayconfig + 删 jar 门禁」那条路）
                             applyHbm(want)
-                        }
-                        try {
-                            val h = dpcHandler
-                            if (h != null) h.postDelayed({ requestPowerUpdate() }, 700L)
-                        } catch (_: Throwable) {
-                        }
-                        try {
-                            val h = dpcHandler
-                            if (h != null) h.postDelayed({ pushAospBrightness(hdrOn) }, 700L)
-                        } catch (_: Throwable) {
+                            try {
+                                val h = dpcHandler
+                                if (h != null) h.postDelayed({ requestPowerUpdate() }, 700L)
+                            } catch (_: Throwable) {
+                            }
+                            try {
+                                val h = dpcHandler
+                                if (h != null) h.postDelayed({ pushAospBrightness(hdrOn) }, 700L)
+                            } catch (_: Throwable) {
+                            }
                         }
                         val why = when {
                             focus == true -> "focus=true"
