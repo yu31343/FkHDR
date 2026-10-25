@@ -60,6 +60,7 @@ FkHDR 只保留 HDR 这一条链，并按平台严格分级，不在别的系统
 | `persist.sys.fkhdr.native` | 1 | `0` = 不用 OPPO 原生驱动 |
 | `persist.sys.fkhdr.fallback` | 1 | `0` = 不用通用兜底 |
 | `persist.sys.fkhdr.video` | 1 | `0` = 不把视频播放算作 HDR 场景 |
+| `persist.sys.fkhdr.hbm` | 1 | `0` = 不强制进 HBM（只提亮到常规最大亮度） |
 | `persist.sys.fkhdr.aosp_force` | 0 | `1` = 在 ColorOS 上也强行走 AOSP 通路（调试用） |
 
 **从旧模块迁移**：上述属性会自动回落读取 `persist.sys.fkoscreen.hdr_*` 旧名字，
@@ -74,6 +75,10 @@ FkHDR 只保留 HDR 这一条链，并按平台严格分级，不在别的系统
 - **类原生**：AOSP 的比值闸门 `hasSdrToHdrRatioSpline()` 在本类面板上是 false，
   且该调用点会被 ART 内联（hook 不生效），所以模块**自己算**：
   `brightnessToBacklight → backlightToNits → handleHdrSdrNitsChanged`。
+- **类原生 · HBM**：很多 ROM 的 HDR 提亮最终靠 `HighBrightnessModeController` 进 HBM，
+  而它的触发条件是 `mIsHdrLayerPresent`（由 SF 的 HDR 图层面积决定）。
+  模块在 HDR 期间直接置位并调 `updateHbmMode()`，等效于「改 displayconfig + 删 jar 门禁」
+  那类模块，但不需要动任何系统文件。
 - **共同点**：HDR 内容出现时把 `brightnessState` 抬到 `1.0`（面板物理最大），
   `sdrBrightnessState` 保留用户亮度；内容结束立刻回落。无白名单，只看内容不看包名。
 

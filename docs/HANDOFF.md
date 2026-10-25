@@ -19,6 +19,12 @@ v1.9.2 修好注入链（**实测面板背光 21→2047→21，物理提亮已�
 原模块检测到 FkHDR 已安装时自动跳过内建 HDR hook，避免双重点火。
 见 `docs/fkhdr-standalone.md`。
 
+**v1.0.1（2026-10-25）**：解码了设备上的「改配置 + 反编译 jar」类模块
+（`hdr_sdr_ratio_fix`），确认其只做了两件事：配置里 `sdrHdrRatioMap` 的 `hdrRatio`
+1.0→5.0、jar 里删 `LocalDisplayAdapter.mSupportUltraHDR` 门禁。
+FkHDR 已补齐对应通路（新增 `HighBrightnessModeController` hook），
+覆盖度分析见 `docs/hbm-module-coverage.md`。
+
 ---
 
 ## 1. 环境与设备
