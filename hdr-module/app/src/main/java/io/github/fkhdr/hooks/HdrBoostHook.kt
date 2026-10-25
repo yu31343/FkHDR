@@ -1276,6 +1276,10 @@ object HdrBoostHook {
     @Volatile private var ratioResolved = false
     /** 上次真正写入的比值；用来把 display-changed 事件降到只在比值变化时发一次 */
     @Volatile private var lastForcedRatio = Float.NaN
+    /** 上次真正写入的时间；亮度渐变（ramp）期间每帧都会调进来，必须再加时间节流 */
+    @Volatile private var lastForceAt = 0L
+    /** 两次 display-changed 之间的最小间隔（ms）。MIUI 桌面收到密集事件会 NPE 崩溃 */
+    private const val FORCE_MIN_INTERVAL_MS = 500L
 
     private fun pushRatioDirect(inner: Any, args: Array<Any?>) {
         if (!aospMode || !enabled()) return
@@ -1323,16 +1327,22 @@ object HdrBoostHook {
             // 所有应用收到 onDisplayChanged；实测 MIUI 桌面（com.miui.home）会在
             // DeviceHelper.isCarWithScreen 抛 NPE 崩掉。所以必须把事件降到最低频。
             val last = lastForcedRatio
-            // 专项链路：系统自己算，我们只在它算不出（NaN）时兜底
-            if (specificMode) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            // ① 比值变化 > 0.05 才写（避免无意义事件）
+            // ② 两次写入至少间隔 FORCE_MIN_INTERVAL_MS：
+            //    亮度渐变期间 setDisplayBrightness 每帧都会调进来，比值也每帧变一点点，
+            //    只靠 ① 仍会形成每帧一次的 display-changed 风暴（MIUI 桌面会崩）。
+            val changed = last.isNaN() || Math.abs(ratio - last) > 0.05f
+            val cooled = now - lastForceAt >= FORCE_MIN_INTERVAL_MS
+            // 专项链路：系统自己算，我们只在它算不出（NaN/0）时兜底
+            val needFallback = if (specificMode) {
                 val sys = currentHdrSdrRatio()
-                if (!sys.isNaN() && sys > 0f) {
-                    // 系统已给出比值，不干预
-                } else if (last.isNaN() || Math.abs(ratio - last) > 0.05f) {
-                    lastForcedRatio = ratio
-                    forceHdrSdrRatio(ratio)
-                }
-            } else if (last.isNaN() || Math.abs(ratio - last) > 0.05f) {
+                sys.isNaN() || sys <= 0f
+            } else {
+                true
+            }
+            if (needFallback && changed && cooled) {
+                lastForceAt = now
                 lastForcedRatio = ratio
                 forceHdrSdrRatio(ratio)
             }
