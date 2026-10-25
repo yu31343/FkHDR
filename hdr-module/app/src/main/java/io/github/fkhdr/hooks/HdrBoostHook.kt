@@ -1001,6 +1001,14 @@ object HdrBoostHook {
     private fun hookInner(cls: Class<*>): Int {
         if (innerHooked) return 1
         if (!hasMethod(cls, "setDisplayBrightness")) return 0
+        // 只按名字接受第一个类有风险：某些 adapter 也有同名方法但永不被调用。
+        // 真正的 LocalDisplayDevice$1 一定同时有 handleHdrSdrNitsChanged。
+        if (!hasMethod(cls, "handleHdrSdrNitsChanged")) {
+            logEvery("wronginner", 60000L) {
+                "$TAG: skip " + cls.name + " (setDisplayBrightness but no handleHdrSdrNitsChanged)"
+            }
+            return 0
+        }
         val n = hookAll(cls, "setDisplayBrightness", brightnessHook)
         if (n > 0) {
             innerCls = cls
@@ -1102,7 +1110,7 @@ object HdrBoostHook {
                 }
                 sdrEff
             } else {
-                Math.min(it, if (b > 1.5f) absMaxBrightness() else 1.0f)
+                Math.min(it, peakBrightness())
             }
         }
         aospPeak = target
@@ -1343,6 +1351,8 @@ object HdrBoostHook {
     @Volatile private var pendingRatio = Float.NaN
     /** 系统最近一次把 mCurrentHdrSdrRatio 写成 NaN 的时间（P0-3：兜底判据用） */
     @Volatile private var sysRatioNaNSince = 0L
+    /** HDR 状态翻转代数：延迟回调只在代数未变时才执行 */
+    @Volatile private var stateGen = 0
 
     private val trailHandler: android.os.Handler by lazy {
         android.os.Handler(android.os.Looper.getMainLooper())
@@ -1572,6 +1582,14 @@ object HdrBoostHook {
         }
         return panelMaxNits > 0f
     }
+
+    /**
+     * 亮度量纲：归一化(0..1) 还是绝对量纲(0..max)。
+     * 判据必须看「面板上限」而不是「当前亮度值」—— 用当前值判断时，
+     * 绝对量纲下用户把亮度调到 1.5 以下就会被误判成归一化，然后 args[0]=1.0 导致接近全黑。
+     */
+    private fun peakBrightness(): Float =
+        if (absMaxBrightness() > 1.5f) absMaxBrightness() else 1.0f
 
     private fun nitsOf(brightness: Float): Float = try {
         if (!resolveCfgMethods()) return Float.NaN
@@ -2340,9 +2358,13 @@ object HdrBoostHook {
                                 if (h != null) h.postDelayed({ requestPowerUpdate() }, 700L)
                             } catch (_: Throwable) {
                             }
+                            // 用翻转时的 want + 代数校验：HDR 快速开关时，旧回调不能把新状态顶掉
+                            val gen = ++stateGen
                             try {
                                 val h = dpcHandler
-                                if (h != null) h.postDelayed({ pushAospBrightness(hdrOn) }, 700L)
+                                if (h != null) {
+                                    h.postDelayed({ if (gen == stateGen) pushAospBrightness(want) }, 700L)
+                                }
                             } catch (_: Throwable) {
                             }
                         }

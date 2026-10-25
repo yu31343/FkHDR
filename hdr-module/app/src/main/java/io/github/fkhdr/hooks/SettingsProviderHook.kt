@@ -26,13 +26,19 @@ object SettingsProviderHook {
     /** 当前线程正在处理「本模块写白名单键」的 mutateSystemSetting */
     private val sModuleWrite = ThreadLocal<Boolean>()
 
+    /** 幂等守卫：本机 SettingsProvider 跑在 system_server 内，两个包名可能命中同一进程，
+     *  重复 init 会把同一方法挂两组 hook，导致 sModuleWrite 的 ThreadLocal 被内层先 remove。 */
+    @Volatile private var inited = false
+
     fun init(classLoader: ClassLoader) {
+        if (inited) return
         val spClass = try {
             XposedHelpers.findClass("com.android.providers.settings.SettingsProvider", classLoader)
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: SettingsProvider not found: " + t.message)
             return
         }
+        inited = true
 
         // 1) 识别「本模块正在写白名单键」的调用，并放行它的写权限校验
         try {
