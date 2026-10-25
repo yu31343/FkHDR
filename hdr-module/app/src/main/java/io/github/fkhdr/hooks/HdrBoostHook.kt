@@ -1682,6 +1682,19 @@ object HdrBoostHook {
     @Volatile private var ultraHdrForced = false
 
     /** ① 替换面板的 sdr->hdr 比值曲线（等效旧模块改 XML） */
+    /** 用 AOSP 自带的静态工厂造 Spline（等价于 XML 解析 <sdrHdrRatioMap>） */
+    private fun buildSpline(splineCls: Class<*>, xs: FloatArray, ys: FloatArray): Any? {
+        for (name in arrayOf("createMonotoneCubicSpline", "createLinearSpline")) {
+            try {
+                val m = splineCls.getMethod(name, FloatArray::class.java, FloatArray::class.java)
+                val v = m.invoke(null, xs, ys)
+                if (v != null) return v
+            } catch (_: Throwable) {
+            }
+        }
+        return null
+    }
+
     private fun installSpecificSpline() {
         if (splineInstalled) return
         val cfg = displayConfig ?: run {
@@ -1700,30 +1713,33 @@ object HdrBoostHook {
                 return
             }
             fld.isAccessible = true
-            val splineType = fld.type
-            XposedBridge.log("$TAG: spline install: field type = " + splineType.name +
-                " interface=" + splineType.isInterface)
-            val handler = java.lang.reflect.InvocationHandler { proxy, method, args ->
-                when (method.name) {
-                    "interpolate" -> {
-                        val nits = (args?.getOrNull(0) as? Float) ?: 0f
-                        // splineRatio 内部懒解析面板曲线；解析不出时返回 cap（有 headroom）
-                        splineRatio(nits)
-                    }
-                    "toString" -> "FkHDR-Spline(cap=" + f2(ratioCap()) + ")"
-                    "hashCode" -> System.identityHashCode(proxy)
-                    "equals" -> proxy === args?.getOrNull(0)
-                    else -> null
-                }
+            val splineCls = fld.type
+            // ★ android.util.Spline 是**抽象类**，不是接口，所以不能用 Proxy。
+            //   正确做法是用 AOSP 自己的静态工厂造一条真曲线 —— 这正是
+            //   DisplayDeviceConfig 解析 display_id_*.xml 里 <sdrHdrRatioMap> 时做的事，
+            //   等价于旧模块改配置文件。
+            if (!resolveCfgMethods()) {
+                XposedBridge.log(
+                    "$TAG: spline install deferred: panel nits unresolved (max=" +
+                        f2(panelMaxNits) + "), will retry"
+                )
+                return
             }
-            val proxy = java.lang.reflect.Proxy.newProxyInstance(
-                splineType.classLoader, arrayOf(splineType), handler
-            )
-            fld.set(cfg, proxy)
-            splineProxy = proxy
+            val cap = ratioCap()
+            val xs = floatArrayOf(panelMinNits, panelMaxNits)
+            val ys = floatArrayOf(cap, 1.0f)   // 低亮度 -> cap，面板最大亮度 -> 1.0
+            val spline = buildSpline(splineCls, xs, ys) ?: run {
+                XposedBridge.log(
+                    "$TAG: spline install FAILED: no static factory on " + splineCls.name
+                )
+                return
+            }
+            fld.set(cfg, spline)
+            splineProxy = spline
             splineInstalled = true
             XposedBridge.log(
-                "$TAG: specific chain ① sdrHdrRatioSpline replaced (cap=" + f2(ratioCap()) + ")"
+                "$TAG: specific chain ① sdrHdrRatioSpline replaced (" + splineCls.simpleName +
+                    " x=[" + f2(xs[0]) + "," + f2(xs[1]) + "] y=[" + f2(ys[0]) + "," + f2(ys[1]) + "])"
             )
         } catch (t: Throwable) {
             logEvery("splinefail", 60000L) { "$TAG: replace sdrHdrRatioSpline failed: " + t }
