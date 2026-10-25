@@ -1250,13 +1250,55 @@ object HdrBoostHook {
             val nits = b2n.invoke(inner, backlight) as? Float ?: return
             val sdrNits = b2n.invoke(inner, sdrBacklight) as? Float ?: return
             apply.invoke(inner, nits, sdrNits)
+            // 系统内部还有两道我们绕不开的条件：
+            //   handleHdrSdrNitsChanged 里要求 (mUseSurfaceControlBrightness || mForceSurfaceControl)，
+            //   小米还额外要求 mSupportUltraHDR（旧模块就是靠反编译删掉这一条）。
+            // 本机实测 mUseSurfaceControlBrightness=false -> 系统会把比值直接写成 NaN。
+            // 所以这里再补一步：直接把 mCurrentHdrSdrRatio 写进 LocalDisplayDevice 并刷新 DeviceInfo，
+            // 与任何内部条件无关。App 最终读到的就是这个值。
+            val ratio = if (sdrNits > 0f) Math.max(1f, nits / sdrNits) else 1f
+            forceHdrSdrRatio(inner, ratio)
             logEvery("ratio2", 2000L) {
                 "$TAG: ratio direct nits=" + f2(nits) + " sdrNits=" + f2(sdrNits) +
-                    " -> ratio=" + f2(if (sdrNits > 0f) nits / sdrNits else Float.NaN) +
-                    " current=" + f2(currentHdrSdrRatio(inner))
+                    " -> ratio=" + f2(ratio) + " current=" + f2(currentHdrSdrRatio(inner))
             }
         } catch (t: Throwable) {
             logEvery("ratiofail", 10000L) { "$TAG: ratio direct failed: " + t }
+        }
+    }
+
+    /**
+     * 直接把比值写进 LocalDisplayDevice，绕开所有内部条件。
+     *
+     * AOSP 的 handleHdrSdrNitsChanged 有三道门：
+     *   ① displayNits/sdrNits != INVALID_NITS
+     *   ② mBacklightAdapter.mUseSurfaceControlBrightness || mForceSurfaceControl
+     *   ③ 小米私有：LocalDisplayAdapter.mSupportUltraHDR
+     * 本机 ② 就是 false，所以系统自己算出来的永远是 NaN。这里跳过它，直接写字段 + 刷新 DeviceInfo。
+     */
+    private fun forceHdrSdrRatio(inner: Any, ratio: Float) {
+        try {
+            val dev = XposedHelpers.getObjectField(inner, "this" + D + "0")
+            val root = try {
+                XposedHelpers.callMethod(dev, "getSyncRoot")
+            } catch (_: Throwable) {
+                null
+            }
+            val apply = Runnable {
+                try {
+                    XposedHelpers.setFloatField(dev, "mCurrentHdrSdrRatio", ratio)
+                    XposedHelpers.callMethod(dev, "updateDeviceInfoLocked")
+                } catch (t: Throwable) {
+                    logEvery("ratioforce", 10000L) { "$TAG: force ratio failed: " + t }
+                }
+            }
+            if (root != null) {
+                synchronized(root) { apply.run() }
+            } else {
+                apply.run()
+            }
+        } catch (t: Throwable) {
+            logEvery("ratioforce2", 10000L) { "$TAG: force ratio failed: " + t }
         }
     }
 
