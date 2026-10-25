@@ -73,6 +73,8 @@ object HdrBoostHook {
     private const val PROP_NATIVE_OLD = "persist.sys.fkoscreen.hdr_native"
     private const val PROP_FALLBACK_OLD = "persist.sys.fkoscreen.hdr_fallback"
     private const val PROP_VIDEO_OLD = "persist.sys.fkoscreen.hdr_video"
+    private const val PROP_HBM = "persist.sys.fkhdr.hbm"
+    private const val PROP_HBM_OLD = "persist.sys.fkoscreen.hdr_hbm"
     private const val PROP_AOSP_FORCE = "persist.sys.fkhdr.aosp_force"
     private const val PROP_AOSP_FORCE_OLD = "persist.sys.fkoscreen.hdr_aosp_force"
 
@@ -203,6 +205,7 @@ object HdrBoostHook {
         if (aospMode) {
             steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
             steps.append(" gate=").append(hookAospRatioGate(classLoader))
+            steps.append(" hbm=").append(hookHighBrightnessModeController(classLoader))
         }
 
         // ── 通用：三类平台都挂（都是 AOSP 基础类，必然存在）──
@@ -1265,6 +1268,70 @@ object HdrBoostHook {
         Float.NaN
     }
 
+    // ── AOSP HBM 通路（补「配置法」的缺口）─────────────────────
+    //
+    // 小米/一加等 ROM 的 HDR 提亮最终靠 HighBrightnessModeController 进 HBM：
+    //     calculateHighBrightnessMode():
+    //         if (!deviceSupportsHbm()) return 0;
+    //         if (mIsHdrLayerPresent || ...) return 2;      // ← HDR 时直接 HBM_ON_HDR
+    //         return isHbmCurrentlyAllowed() ? 1 : 0;
+    // 而 mIsHdrLayerPresent 由 SurfaceControlHdrLayerInfoListener 根据「HDR 图层面积
+    // >= 屏幕面积 × minimumHdrPercentOfScreen」置位。很多 ROM 默认要求 HDR 占屏 ≥50%，
+    // 或者应用根本没把窗口 colorMode 设成 HDR，于是 SF 永远不上报 → HBM 永远不进。
+    //
+    // 这类机型常见的修法是「改 displayconfig XML + 反编译 services.jar 删门禁」，
+    // 我们改为运行时等效：HDR 期间直接置 mIsHdrLayerPresent=true 并触发 updateHbmMode()。
+    // 只在 AOSP 通路生效；ColorOS 有自己的原生驱动，不重复干预。
+    @Volatile private var hbmCtl: Any? = null
+
+    private fun hbmEnabled(): Boolean = prop2(PROP_HBM, PROP_HBM_OLD, "1") != "0"
+
+    private fun hookHighBrightnessModeController(classLoader: ClassLoader): Boolean = try {
+        val cls = XposedHelpers.findClass(
+            "com.android.server.display.HighBrightnessModeController", classLoader
+        )
+        XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                hbmCtl = param.thisObject
+                logEvery("hbmctl", 60000L) { "$TAG: HBM controller captured" }
+            }
+        })
+        true
+    } catch (t: Throwable) {
+        logEvery("hbmcls", 60000L) { "$TAG: HighBrightnessModeController unavailable: " + t.message }
+        false
+    }
+
+    /** HDR 翻转时强制/恢复 HBM。失败只打日志，不影响主链路。 */
+    private fun applyHbm(boost: Boolean) {
+        if (!aospMode || !enabled() || !hbmEnabled()) return
+        val c = hbmCtl ?: run {
+            logEvery("hbmnoctl", 10000L) { "$TAG: HBM skipped: controller not captured" }
+            return
+        }
+        try {
+            XposedHelpers.setBooleanField(c, "mIsHdrLayerPresent", boost)
+            try {
+                // 目标 HDR/SDR 比：决定 getHdrBrightnessValue() 的 headroom
+                XposedHelpers.setFloatField(
+                    c, "mMaxDesiredHdrSdrRatio", if (boost) factor().coerceIn(1f, 20f) else 1f
+                )
+            } catch (_: Throwable) {
+            }
+            XposedHelpers.callMethod(c, "updateHbmMode")
+            val mode = try {
+                XposedHelpers.getIntField(c, "mHbmMode")
+            } catch (_: Throwable) {
+                -1
+            }
+            logEvery("hbm", 2000L) {
+                "$TAG: hbm hdrLayerPresent=" + boost + " -> mode=" + mode + " (2=HBM_ON_HDR)"
+            }
+        } catch (t: Throwable) {
+            logEvery("hbmfail", 10000L) { "$TAG: hbm apply failed: " + t }
+        }
+    }
+
     /**
      * AOSP 真正的 HDR 比值闸门。
      *
@@ -1717,6 +1784,8 @@ object HdrBoostHook {
                         requestPowerUpdate()
                         // 类原生：主动把面板亮度推到顶（并保留 SDR 白点），否则永远等不到亮度变化事件
                         pushAospBrightness(want)
+                        // 类原生：强制进/出 HBM（等效于「改 displayconfig + 删 jar 门禁」那条路）
+                        applyHbm(want)
                         try {
                             val h = dpcHandler
                             if (h != null) h.postDelayed({ requestPowerUpdate() }, 700L)
