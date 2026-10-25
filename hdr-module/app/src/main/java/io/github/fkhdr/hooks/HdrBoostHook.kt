@@ -1868,7 +1868,48 @@ object HdrBoostHook {
         val cls = XposedHelpers.findClass(
             "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice", classLoader
         )
-        val n = XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
+        // ★ 直接拦截 setter 本身：无论谁调用、调多少次、传什么，一律强制成 true。
+        //   只 hook 构造函数再补一次是不够的 —— 实测运行时读回来仍是 false
+        //   （PROBE ... [use=false force=false ultra=true]），说明补写没作用到活着的实例。
+        var n = 0
+        try {
+            val baCls = XposedHelpers.findClass(
+                "com.android.server.display.LocalDisplayAdapter" + D + "BacklightAdapter", classLoader
+            )
+            n += XposedBridge.hookAllMethods(baCls, "setForceSurfaceControl",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (param.args.isNotEmpty()) param.args[0] = true
+                        forceSurfaceControlSet = true
+                        logEvery("forceSet", 60000L) {
+                            "$TAG: AOSP-align ①' setForceSurfaceControl -> true (vendor gate opened)"
+                        }
+                    }
+                }).size
+            // ★ 关键：setForceSurfaceControl 只在 loadDisplayDeviceConfig() 里被调用，
+            //   而 BacklightAdapter 构造函数会把 mForceSurfaceControl 初始化为 false。
+            //   只要适配器被重建过一次，之前那次补写就丢了（实测 PROBE 一直是 force=false）。
+            //   所以直接 hook 构造函数，保证任何实例创建完就是 true。
+            n += XposedBridge.hookAllConstructors(baCls, object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    try {
+                        XposedHelpers.setBooleanField(param.thisObject, "mForceSurfaceControl", true)
+                        forceSurfaceControlSet = true
+                        logEvery("forceCtor", 60000L) {
+                            "$TAG: AOSP-align ①' BacklightAdapter ctor -> mForceSurfaceControl=true"
+                        }
+                    } catch (t: Throwable) {
+                        logEvery("forceCtorFail", 60000L) {
+                            "$TAG: force flag write failed: " + t
+                        }
+                    }
+                }
+            }).size
+        } catch (t: Throwable) {
+            logEvery("forcehook2", 60000L) { "$TAG: BacklightAdapter hook failed: " + t.message }
+        }
+        // 构造函数里再补一次（双保险）
+        n += XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 try {
                     val ba = XposedHelpers.getObjectField(param.thisObject, "mBacklightAdapter")
@@ -1878,17 +1919,14 @@ object HdrBoostHook {
                     }
                     XposedHelpers.callMethod(ba, "setForceSurfaceControl", true)
                     forceSurfaceControlSet = true
-                    XposedBridge.log(
-                        "$TAG: AOSP-align ①' mForceSurfaceControl = true (vendor gate opened)"
-                    )
                 } catch (t: Throwable) {
                     logEvery("forcefail", 60000L) {
                         "$TAG: setForceSurfaceControl(true) failed: " + t
                     }
                 }
             }
-        })
-        n.size
+        }).size
+        n
     } catch (t: Throwable) {
         logEvery("forcehook", 60000L) { "$TAG: LocalDisplayDevice ctor hook failed: " + t.message }
         0
