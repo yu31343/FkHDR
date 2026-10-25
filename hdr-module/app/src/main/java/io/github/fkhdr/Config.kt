@@ -28,6 +28,16 @@ object Config {
     const val MIN_RATIO_MAX = 1.0f
     const val MAX_RATIO_MAX = 20.0f
 
+    /** 门禁守护：是否周期性（3s）重申 mSupportUltraHDR / mForceSurfaceControl。
+     *  默认关闭 —— 正常情况开机时置位一次即可；只有 ROM 会中途重置时才需要打开。 */
+    const val KEY_GATE_WATCHDOG = "hdr_gate_watchdog"
+
+    fun getGateWatchdog(): Boolean = try {
+        getBooleanConfig(KEY_GATE_WATCHDOG, false)
+    } catch (_: Throwable) {
+        false
+    }
+
     /** 读封顶上限；读不到用默认 5.0 */
     fun getRatioMax(): Float {
         val fromSettings = try {

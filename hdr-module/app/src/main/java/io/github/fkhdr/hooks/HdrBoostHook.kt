@@ -1772,6 +1772,23 @@ object HdrBoostHook {
         specificMode = splineInstalled && ultraHdrForced && forceSurfaceControlSet
     }
 
+    @Volatile private var wdCache = false
+    @Volatile private var wdAt = 0L
+
+    /** 门禁守护开关（Settings.System:hdr_gate_watchdog，默认 false） */
+    private fun gateWatchdogEnabled(): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - wdAt < 5000L) return wdCache
+        val v = try {
+            io.github.fkhdr.Config.getGateWatchdog()
+        } catch (_: Throwable) {
+            false
+        }
+        wdCache = v
+        wdAt = now
+        return v
+    }
+
     /** 周期性把厂商加的两道门禁重新置 true（等效于旧模块「反编译删掉那三个判断」） */
     private fun reassertVendorGates() {
         try {
@@ -1804,9 +1821,10 @@ object HdrBoostHook {
         if (now - lastModeCheckAt < 3000L) return
         lastModeCheckAt = now
         if (!ultraHdrForced) updateSpecificMode()
-        // 重申门禁标志：ROM 可能在别处重置 mSupportUltraHDR / mForceSurfaceControl，
-        // 一旦被重置，系统就会退回「比值恒 NaN」。这里每 3s 补一次，成本可忽略。
-        reassertVendorGates()
+        // 门禁守护是**可选**的：正常情况下开机时在构造函数里置位一次就够了。
+        // 只有 ROM 会在运行中重置 mSupportUltraHDR / mForceSurfaceControl 时才需要打开
+        // （App 里的「门禁守护」开关，默认关闭）。
+        if (gateWatchdogEnabled()) reassertVendorGates()
         val cfg = displayConfig
         if (cfg != null && splineInstalled) {
             try {

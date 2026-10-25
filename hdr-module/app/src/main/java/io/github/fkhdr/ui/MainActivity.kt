@@ -25,6 +25,7 @@ class MainActivity : Activity() {
 
     private lateinit var hdrSwitch: Switch
     private lateinit var statusText: TextView
+    private lateinit var gateSwitch: Switch
     private lateinit var capValue: TextView
     private lateinit var capSeek: SeekBar
 
@@ -157,6 +158,34 @@ class MainActivity : Activity() {
             ).withTop(dp(6))
         )
         root.addView(capCard)
+
+        // 门禁守护卡片（默认关闭：开机置位一次即可）
+        val wdCard = card().withTop(dp(12))
+        val wdRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        wdRow.addView(
+            text("门禁守护（每 3 秒重申）", 16f, TEXT, true),
+            LinearLayout.LayoutParams(0, WRAP, 1f)
+        )
+        gateSwitch = Switch(this).apply {
+            isChecked = Config.getGateWatchdog()
+            setOnCheckedChangeListener { _, isChecked ->
+                if (binding) return@setOnCheckedChangeListener
+                Config.writeConfig(this@MainActivity, Config.KEY_GATE_WATCHDOG, isChecked)
+            }
+        }
+        wdRow.addView(gateSwitch, LinearLayout.LayoutParams(WRAP, WRAP))
+        wdCard.addView(wdRow)
+        wdCard.addView(
+            text(
+                "默认关闭。正常情况下模块在开机注入时把厂商门禁置位一次就够了。" +
+                    "只有发现 HDR 用一会儿又失效（说明 ROM 在运行中把标志重置了）时才需要打开。",
+                13f, BODY
+            ).withTop(dp(6))
+        )
+        root.addView(wdCard)
 
         // 作用
         val effect = card().withTop(dp(12))
