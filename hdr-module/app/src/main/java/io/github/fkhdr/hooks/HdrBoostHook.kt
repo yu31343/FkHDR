@@ -211,6 +211,8 @@ object HdrBoostHook {
                 steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
                 steps.append(" hbm=").append(hookHighBrightnessModeController(classLoader))
             }
+            // 只读诊断，两种链路都挂（不改行为）
+            steps.append(" probe=").append(hookRatioProbeOnly(classLoader))
             steps.append(" chain=").append(if (specificOnlyChain) "SPECIFIC-ONLY" else "GENERIC")
         }
         // 注意：hookAospRatioGate(DisplayDeviceConfig.hasSdrToHdrRatioSpline) 已删除。
@@ -1682,6 +1684,46 @@ object HdrBoostHook {
     @Volatile private var ultraHdrForced = false
 
     /** ① 替换面板的 sdr->hdr 比值曲线（等效旧模块改 XML） */
+    /**
+     * 只读诊断：打印 handleHdrSdrNitsChanged 的真实入参与门禁状态。
+     * 不改任何行为，纯粹为了「比值为什么是 1」能一眼看出来。
+     */
+    private fun hookRatioProbeOnly(classLoader: ClassLoader): Int = try {
+        val cls = XposedHelpers.findClass(
+            "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice" + D + "1",
+            classLoader
+        )
+        hookAll(cls, "handleHdrSdrNitsChanged", object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                logEvery("probeOnly", 2000L) {
+                    val nits = param.args.getOrNull(0) as? Float ?: Float.NaN
+                    val sdrNits = param.args.getOrNull(1) as? Float ?: Float.NaN
+                    var gates = "?"
+                    try {
+                        val dev = XposedHelpers.getObjectField(param.thisObject, "this" + D + "1")
+                        val ba = XposedHelpers.getObjectField(dev, "mBacklightAdapter")
+                        val adapter = XposedHelpers.getObjectField(dev, "this" + D + "0")
+                        gates = "use=" + XposedHelpers.getBooleanField(ba, "mUseSurfaceControlBrightness") +
+                            " force=" + XposedHelpers.getBooleanField(ba, "mForceSurfaceControl") +
+                            " ultra=" + XposedHelpers.getBooleanField(adapter, "mSupportUltraHDR")
+                    } catch (_: Throwable) {
+                    }
+                    val cur = try {
+                        val dev = XposedHelpers.getObjectField(param.thisObject, "this" + D + "1")
+                        XposedHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
+                    } catch (_: Throwable) {
+                        Float.NaN
+                    }
+                    "$TAG: PROBE handleHdrSdrNitsChanged(nits=" + f2(nits) +
+                        " sdrNits=" + f2(sdrNits) + ") -> current=" + f2(cur) + " [" + gates + "]"
+                }
+            }
+        })
+    } catch (t: Throwable) {
+        logEvery("probefail", 60000L) { "$TAG: ratio probe hook failed: " + t.message }
+        0
+    }
+
     /** 用 AOSP 自带的静态工厂造 Spline（等价于 XML 解析 <sdrHdrRatioMap>） */
     private fun buildSpline(splineCls: Class<*>, xs: FloatArray, ys: FloatArray): Any? {
         for (name in arrayOf("createMonotoneCubicSpline", "createLinearSpline")) {
