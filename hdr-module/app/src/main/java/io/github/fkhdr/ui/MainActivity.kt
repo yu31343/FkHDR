@@ -41,6 +41,16 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         if (::hdrSwitch.isInitialized) applyState(Config.isHdrFixEnabled())
+        // 自愈：模块未激活时写 Settings.System 会被拒（无 WRITE_SETTINGS / 无 root），
+        // 值只落到本地 prefs。等模块激活（SettingsProviderHook 生效）后，
+        // 每次回到界面都把本地值补写回 Settings.System，保证 system_server 读得到。
+        try {
+            if (::hdrSwitch.isInitialized) {
+                Config.writeConfig(this, Config.KEY_HDR_RATIO, hdrSwitch.isChecked)
+            }
+            Config.setRatioMax(this, Config.getRatioMax())
+        } catch (_: Throwable) {
+        }
     }
 
     /**
@@ -137,6 +147,7 @@ class MainActivity : Activity() {
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         }
+        capValue.text = String.format("%.1f", Config.getRatioMax())
         capCard.addView(capSeek.withTop(dp(4)))
         capCard.addView(
             text(
@@ -152,8 +163,8 @@ class MainActivity : Activity() {
         effect.addView(sectionTitle("作用"))
         effect.addView(
             text(
-                "HDR 内容出现时，把面板亮度推到物理最大值，并向系统上报真实的 HDR/SDR 比值；" +
-                    "SDR 白点保持不变，退出 HDR 后自动回落。",
+                "HDR 内容出现时，按「SDR 白点 × 上面的封顶上限」把面板亮度抬上去，" +
+                    "并让系统上报真实的 HDR/SDR 比值；SDR 白点本身不变，退出 HDR 后自动回落。",
                 14f, BODY
             ).withTop(dp(8))
         )
