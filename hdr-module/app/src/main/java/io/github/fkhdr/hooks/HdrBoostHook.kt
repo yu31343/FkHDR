@@ -1684,15 +1684,32 @@ object HdrBoostHook {
     /** ① 替换面板的 sdr->hdr 比值曲线（等效旧模块改 XML） */
     private fun installSpecificSpline() {
         if (splineInstalled) return
-        val cfg = displayConfig ?: return
-        if (!resolveCfgMethods()) return
+        val cfg = displayConfig ?: run {
+            XposedBridge.log("$TAG: spline install deferred: displayConfig not captured yet")
+            return
+        }
+        // 不再要求「面板 nits 曲线先解析成功」才安装曲线：
+        // 插值是惰性求值的（splineRatio 内部会自行解析，解析不出时退回 cap），
+        // 所以这里只要字段存在就装。否则一旦解析失败，整条链路会静默失效。
         try {
-            val fld = cfg.javaClass.getDeclaredField("mSdrToHdrRatioSpline")
+            val fld = findFieldUp(cfg.javaClass, "mSdrToHdrRatioSpline") ?: run {
+                XposedBridge.log(
+                    "$TAG: spline install FAILED: field mSdrToHdrRatioSpline not found on " +
+                        cfg.javaClass.name
+                )
+                return
+            }
             fld.isAccessible = true
             val splineType = fld.type
+            XposedBridge.log("$TAG: spline install: field type = " + splineType.name +
+                " interface=" + splineType.isInterface)
             val handler = java.lang.reflect.InvocationHandler { proxy, method, args ->
                 when (method.name) {
-                    "interpolate" -> splineRatio((args?.getOrNull(0) as? Float) ?: 0f)
+                    "interpolate" -> {
+                        val nits = (args?.getOrNull(0) as? Float) ?: 0f
+                        // splineRatio 内部懒解析面板曲线；解析不出时返回 cap（有 headroom）
+                        splineRatio(nits)
+                    }
                     "toString" -> "FkHDR-Spline(cap=" + f2(ratioCap()) + ")"
                     "hashCode" -> System.identityHashCode(proxy)
                     "equals" -> proxy === args?.getOrNull(0)
@@ -1726,11 +1743,22 @@ object HdrBoostHook {
      */
     @Volatile private var specificOnlyChain = false
 
-    private fun hasField(c: Class<*>, name: String): Boolean = try {
-        c.getDeclaredField(name)
-        true
-    } catch (_: Throwable) {
-        false
+    private fun hasField(c: Class<*>, name: String): Boolean = findFieldUp(c, name) != null
+
+    /** 沿继承链找字段：厂商常常把 DisplayDeviceConfig 再派生一层，字段在父类上，
+     *  只用 getDeclaredField 会直接 NoSuchFieldException。 */
+    private fun findFieldUp(c: Class<*>, name: String): java.lang.reflect.Field? {
+        var k: Class<*>? = c
+        while (k != null) {
+            try {
+                val fd = k.getDeclaredField(name)
+                fd.isAccessible = true
+                return fd
+            } catch (_: Throwable) {
+            }
+            k = k.superclass
+        }
+        return null
     }
 
     private fun hasMethod(c: Class<*>, name: String, vararg p: Class<*>): Boolean = try {
@@ -1895,9 +1923,8 @@ object HdrBoostHook {
         val cfg = displayConfig
         if (cfg != null && splineInstalled) {
             try {
-                val fld = cfg.javaClass.getDeclaredField("mSdrToHdrRatioSpline")
-                fld.isAccessible = true
-                if (fld.get(cfg) !== splineProxy) {
+                val fld = findFieldUp(cfg.javaClass, "mSdrToHdrRatioSpline")
+                if (fld != null && fld.get(cfg) !== splineProxy) {
                     splineInstalled = false
                     XposedBridge.log("$TAG: sdrHdrRatioSpline was replaced by system -> reinstall")
                     installSpecificSpline()
