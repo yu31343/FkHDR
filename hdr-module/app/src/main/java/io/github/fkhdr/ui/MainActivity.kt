@@ -9,6 +9,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import io.github.fkhdr.Config
@@ -24,6 +25,8 @@ class MainActivity : Activity() {
 
     private lateinit var hdrSwitch: Switch
     private lateinit var statusText: TextView
+    private lateinit var capValue: TextView
+    private lateinit var capSeek: SeekBar
 
     /** 程序化回写开关状态时置位，避免触发监听器造成回环写入 */
     private var binding = false
@@ -102,6 +105,47 @@ class MainActivity : Activity() {
         statusText = text("", 13f, MUTED).withTop(dp(8))
         switchCard.addView(statusText)
         root.addView(switchCard)
+
+        // 比值封顶上限卡片
+        val capCard = card().withTop(dp(12))
+        capCard.addView(sectionTitle("比值封顶上限"))
+        val capRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        capValue = text("", 20f, TEXT, true)
+        capRow.addView(capValue, LinearLayout.LayoutParams(WRAP, WRAP))
+        capRow.addView(
+            text("×  (HDR 峰值 / SDR 白点)", 12f, MUTED),
+            LinearLayout.LayoutParams(0, WRAP, 1f).also { it.leftMargin = dp(8) }
+        )
+        capCard.addView(capRow)
+        capSeek = SeekBar(this).apply {
+            max = ((Config.MAX_RATIO_MAX - Config.MIN_RATIO_MAX) * 2f).toInt()
+            progress = ((Config.getRatioMax() - Config.MIN_RATIO_MAX) * 2f).toInt()
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                    val v = Config.MIN_RATIO_MAX + progress / 2f
+                    capValue.text = String.format("%.1f", v)
+                    if (fromUser) {
+                        Config.setRatioMax(this@MainActivity, v)
+                        Config.writeConfig(this@MainActivity, Config.KEY_HDR_RATIO, hdrSwitch.isChecked)
+                    }
+                }
+
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        capCard.addView(capSeek.withTop(dp(4)))
+        capCard.addView(
+            text(
+                "低亮度时 HDR 高光最多比 SDR 白点亮这么多倍；亮度越高上限自动下降，" +
+                    "拉到最亮时回落到 1.0（无 headroom）。默认 5.0，与旧版配置模块一致。",
+                13f, BODY
+            ).withTop(dp(6))
+        )
+        root.addView(capCard)
 
         // 作用
         val effect = card().withTop(dp(12))

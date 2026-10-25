@@ -1043,13 +1043,23 @@ object HdrBoostHook {
         if (!aospMode || !enabled() || !hdrOn) return
 
         val sdrEff = if (sdr.isFinite() && sdr > 0.001f) sdr else b
-        val peak = if (b > 1.5f) absMaxBrightness() else 1.0f
-        aospPeak = peak
-        if (peak > sdrEff) {
-            a[1] = peak
+        // 目标亮度 = SDR 亮度 × 上限曲线(sdrNits)，而不是硬推到面板最大。
+        // 这样 SDR 白点不动、比值被曲线封顶，行为与旧模块改 XML 完全一致。
+        val sdrNits = nitsOf(sdrEff)
+        val ratio = splineRatio(sdrNits)
+        val target = brightnessOfNits(sdrNits * ratio).let {
+            if (it.isNaN() || it <= 0f) {
+                if (b > 1.5f) absMaxBrightness() else 1.0f   // 面板曲线不可用时的退路
+            } else {
+                Math.min(it, if (b > 1.5f) absMaxBrightness() else 1.0f)
+            }
+        }
+        aospPeak = target
+        if (target > sdrEff) {
+            a[1] = target
             logEvery("aosppush", 2000L) {
-                "$TAG: aosp push brightness " + f2(sdrEff) + " -> " + f2(peak) +
-                    " (sdr kept " + f2(sdrEff) + ")"
+                "$TAG: aosp push " + f2(sdrEff) + " -> " + f2(target) +
+                    " (sdrNits=" + f2(sdrNits) + " ratio=" + f2(ratio) + ")"
             }
         }
     }
@@ -1267,7 +1277,9 @@ object HdrBoostHook {
             // 本机实测 mUseSurfaceControlBrightness=false -> 系统会把比值直接写成 NaN。
             // 所以这里再补一步：直接把 mCurrentHdrSdrRatio 写进 LocalDisplayDevice 并刷新 DeviceInfo，
             // 与任何内部条件无关。App 最终读到的就是这个值。
-            val ratio = if (sdrNits > 0f) Math.max(1f, nits / sdrNits) else 1f
+            // 系统公式 max(1, nits/sdrNits)，再按 App 设定的上限封顶
+            val raw = if (sdrNits > 0f) Math.max(1f, nits / sdrNits) else 1f
+            val ratio = Math.min(raw, ratioCap())
             // 只在比值「真的变了」才写。
             // 每次写都会走 updateDeviceInfoLocked -> sendDisplayDeviceEventLocked ->
             // 所有应用收到 onDisplayChanged；实测 MIUI 桌面（com.miui.home）会在
@@ -1349,6 +1361,108 @@ object HdrBoostHook {
         XposedHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
     } catch (_: Throwable) {
         Float.NaN
+    }
+
+    // ── 面板 nits 曲线 + 上限曲线（与旧模块「改 displayconfig」等价，但走系统逻辑）──
+    //
+    // 旧模块的做法是改 display_id_*.xml 里的 sdrHdrRatioMap：
+    //     <point><sdrNits>2.0</sdrNits><hdrRatio>5.0</hdrRatio></point>
+    //     <point><sdrNits>650.0</sdrNits><hdrRatio>1.0</hdrRatio></point>
+    // 于是 DisplayDeviceConfig.getHdrBrightnessFromSdr() 会给系统一个「HDR 目标亮度」，
+    // DPC 用它算亮度、setDisplayBrightness 再把 nits/sdrNits 交给 handleHdrSdrNitsChanged，
+    // 比值天然 ≤ 5，且 SDR 白点不动。
+    //
+    // 我们不改文件，改为运行时：
+    //   ① 用面板自己的 screenBrightnessMap 取到 minNits/maxNits（不写死）
+    //   ② 用「低亮度 -> cap，高亮度 -> 1.0」的线性曲线，与旧 XML 完全同形
+    //   ③ 上限 cap 由 App 设置（默认 5.0，与旧模块一致）
+    @Volatile private var panelMinNits = Float.NaN
+    @Volatile private var panelMaxNits = Float.NaN
+    @Volatile private var cfgMtdNits: java.lang.reflect.Method? = null
+    @Volatile private var cfgMtdBacklight: java.lang.reflect.Method? = null
+    @Volatile private var cfgMtdBacklightFromNits: java.lang.reflect.Method? = null
+    @Volatile private var cfgMtdBrightnessFromBacklight: java.lang.reflect.Method? = null
+    @Volatile private var cfgMethodsResolved = false
+
+    private fun resolveCfgMethods(): Boolean {
+        if (cfgMethodsResolved) return panelMaxNits > 0f
+        val cfg = displayConfig ?: return false
+        try {
+            val c = cfg.javaClass
+            val F = java.lang.Float.TYPE
+            cfgMtdNits = c.getMethod("getNitsFromBacklight", F)
+            cfgMtdBacklight = c.getMethod("getBacklightFromBrightness", F)
+            cfgMtdBacklightFromNits = c.getMethod("getBacklightFromNits", F)
+            cfgMtdBrightnessFromBacklight = c.getMethod("getBrightnessFromBacklight", F)
+            val bl0 = cfgMtdBacklight!!.invoke(cfg, 0.0f) as Float
+            val bl1 = cfgMtdBacklight!!.invoke(cfg, 1.0f) as Float
+            val n0 = cfgMtdNits!!.invoke(cfg, bl0) as Float
+            val n1 = cfgMtdNits!!.invoke(cfg, bl1) as Float
+            if (n1 > 0f && n1 > n0) {
+                panelMinNits = n0
+                panelMaxNits = n1
+            }
+            cfgMethodsResolved = true
+            XposedBridge.log(
+                "$TAG: panel nits curve [min=" + f2(n0) + " max=" + f2(n1) +
+                    "] ratioCap=" + f2(ratioCap())
+            )
+        } catch (t: Throwable) {
+            logEvery("cfgmtd", 60000L) { "$TAG: panel nits curve unavailable: " + t }
+            return false
+        }
+        return panelMaxNits > 0f
+    }
+
+    private fun nitsOf(brightness: Float): Float = try {
+        if (!resolveCfgMethods()) return Float.NaN
+        val cfg = displayConfig ?: return Float.NaN
+        val bl = cfgMtdBacklight!!.invoke(cfg, brightness) as Float
+        cfgMtdNits!!.invoke(cfg, bl) as Float
+    } catch (_: Throwable) {
+        Float.NaN
+    }
+
+    private fun brightnessOfNits(nits: Float): Float = try {
+        if (!resolveCfgMethods()) return Float.NaN
+        val cfg = displayConfig ?: return Float.NaN
+        val bl = cfgMtdBacklightFromNits!!.invoke(cfg, nits) as Float
+        cfgMtdBrightnessFromBacklight!!.invoke(cfg, bl) as Float
+    } catch (_: Throwable) {
+        Float.NaN
+    }
+
+    /** App 可配的封顶上限（Settings.System:hdr_ratio_max，默认 5.0 = 旧模块的值） */
+    @Volatile private var capCache = Float.NaN
+    @Volatile private var capAt = 0L
+
+    private fun ratioCap(): Float {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val c = capCache
+        if (!c.isNaN() && now - capAt < 3000L) return c
+        val v = try {
+            io.github.fkhdr.Config.getRatioMax()
+        } catch (_: Throwable) {
+            5.0f
+        }
+        capCache = v
+        capAt = now
+        return v
+    }
+
+    /**
+     * 与旧 XML 完全同形的上限曲线：
+     *   sdrNits <= 面板最小 nits  -> cap
+     *   sdrNits >= 面板最大 nits  -> 1.0
+     *   中间线性插值
+     */
+    private fun splineRatio(sdrNits: Float): Float {
+        val cap = ratioCap()
+        if (!resolveCfgMethods() || sdrNits <= 0f || sdrNits.isNaN()) return cap
+        val span = panelMaxNits - panelMinNits
+        if (span <= 0f) return cap
+        val t = ((sdrNits - panelMinNits) / span).coerceIn(0f, 1f)
+        return cap + (1f - cap) * t
     }
 
     // ── AOSP HBM 通路（补「配置法」的缺口）─────────────────────

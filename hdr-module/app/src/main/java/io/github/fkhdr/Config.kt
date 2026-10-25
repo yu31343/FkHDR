@@ -22,6 +22,54 @@ object Config {
     /** 与旧模块共用同一 Settings.System 键，保证用户旧设置可继承 */
     const val KEY_HDR_RATIO = "hdr_ratio_fix"
 
+    /** HDR/SDR 比值封顶上限（浮点，写 Settings.System）。默认 5.0 = 旧模块 XML 里的值 */
+    const val KEY_RATIO_MAX = "hdr_ratio_max"
+    const val DEFAULT_RATIO_MAX = 5.0f
+    const val MIN_RATIO_MAX = 1.0f
+    const val MAX_RATIO_MAX = 20.0f
+
+    /** 读封顶上限；读不到用默认 5.0 */
+    fun getRatioMax(): Float {
+        val fromSettings = try {
+            val cr = appContext()?.contentResolver
+            if (cr == null) null
+            else android.provider.Settings.System.getFloat(cr, KEY_RATIO_MAX, DEFAULT_RATIO_MAX)
+        } catch (_: Throwable) {
+            null
+        }
+        val v = fromSettings ?: try {
+            getXPrefs().getFloat(KEY_RATIO_MAX, DEFAULT_RATIO_MAX)
+        } catch (_: Throwable) {
+            DEFAULT_RATIO_MAX
+        }
+        return v.coerceIn(MIN_RATIO_MAX, MAX_RATIO_MAX)
+    }
+
+    /** 写封顶上限 */
+    fun setRatioMax(ctx: Context, value: Float): Boolean {
+        val v = value.coerceIn(MIN_RATIO_MAX, MAX_RATIO_MAX)
+        try {
+            getAppPrefs(ctx).edit().putFloat(KEY_RATIO_MAX, v).apply()
+        } catch (_: Throwable) {
+        }
+        val ok = try {
+            android.provider.Settings.System.putFloat(ctx.contentResolver, KEY_RATIO_MAX, v)
+        } catch (_: Throwable) {
+            false
+        }
+        if (!ok) {
+            Thread {
+                try {
+                    Runtime.getRuntime()
+                        .exec(arrayOf("su", "-c", "settings put system " + KEY_RATIO_MAX + " " + v))
+                        .waitFor()
+                } catch (_: Throwable) {
+                }
+            }.start()
+        }
+        return ok
+    }
+
     private var xPrefs: XSharedPreferences? = null
 
     fun getXPrefs(): XSharedPreferences {
