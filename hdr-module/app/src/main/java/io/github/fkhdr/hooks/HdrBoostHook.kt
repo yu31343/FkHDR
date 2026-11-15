@@ -89,6 +89,8 @@ object HdrBoostHook {
     private const val POLL_MS = 400L
     /** 类原生退出迟滞：HDR 消失后继续维持这么久才回落，消除瞬时闪烁 */
     private const val HDR_EXIT_HOLD_MS = 1200L
+    /** 只剩窗口信号、SF 已确认没有 HDR 图层时，最多还信它多久 */
+    private const val HDR_FOCUS_ONLY_HOLD_MS = 3000L
 
     /** 认为「系统自己已经提亮过」的阈值：nit / sdrNit */
     private const val RATIO_DONE = 1.02f
@@ -698,6 +700,16 @@ object HdrBoostHook {
         Xp.log("$TAG: driver ready (deferred) [" + hardenDriver(pending) + "]")
     }
 
+    /** 退出时把厂商驱动的提亮标志位放下；HDR 状态下不做任何写入。 */
+    private fun clearDriverEnhance(selfOrNull: Any?) {
+        val self = selfOrNull ?: return
+        try {
+            XpHelpers.setBooleanField(self, "mEnterWhiteApp", false)
+            XpHelpers.setBooleanField(self, "mNeedToEnhanceBrightness", false)
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun callPriv(selfOrNull: Any?, name: String) {
         val self = selfOrNull ?: return
         try {
@@ -865,6 +877,24 @@ object HdrBoostHook {
             val base = num(builder, "getNit")
             if (base.isNaN() || base <= 0f) return false
             val sdr = num(builder, "getSdrNit")
+            // 压暗对齐：厂商原生驱动会把 nit 直接顶到面板上限（本站实测 99.4 -> 846.09 = 8.51x），
+            // 但 SurfaceFlinger 只按自己的 hdr/sdr ratio（本站 5.0）压暗 SDR 层。
+            // 两者不一致时 SDR 会按 (8.51/5.0) 偏亮，观感就是「提亮了但没压暗」。
+            // 这里把 nit 收口到 sdrNit * ratioCap()，让模块的提亮倍数与 SF 的压暗倍数同一个数，
+            // 同时让 App 里的「比值封顶上限」在这条路径上也实时可控。
+            if (!sdr.isNaN() && sdr > 0f) {
+                val cap = ratioCap()
+                val cur = base / sdr
+                if (cap >= 1f && cur > cap + 0.01f) {
+                    val clamped = sdr * cap
+                    XpHelpers.callMethod(builder, "setNit", clamped)
+                    logEvery("clamphalt", 2000L) {
+                        "$TAG: hdr nit clamped " + f2(base) + " -> " + f2(clamped) +
+                            " (ratio " + f2(cur) + " -> cap " + f2(cap) + ")"
+                    }
+                    return true
+                }
+            }
             if (!sdr.isNaN() && sdr > 0f && base / sdr > RATIO_DONE) {
                 // 原生驱动已经提亮了，兜底保持静默（证明日志：fallback idle）
                 logEvery("fb_idle", 10000L) {
@@ -2319,6 +2349,8 @@ object HdrBoostHook {
     @Volatile private var gateUntil = 0L
     /** HDR 内容首次消失的时刻（用于退出迟滞） */
     @Volatile private var hdrOffSince = 0L
+    /** ColorOS 原生路径上「只剩窗口信号、SF 已无 HDR 图层」的起点 */
+    @Volatile private var noContentSince = 0L
 
     /**
      * 只读比值诊断探针：打印 handleHdrSdrNitsChanged 的真实入参与算出的比值。
@@ -2515,6 +2547,9 @@ object HdrBoostHook {
     }
 
     private val HDR_META_RE = Regex("hdr metadata types=([0-9]+)")
+    /** HDR10/PQ 的 SF dataspace 头（Android 16 / ColorOS 平板实测：图层不带静态元数据，只换 dataspace） */
+    private const val HDR_DATASPACE_MARK = "dataspace=0x188a"
+    private val HDR_RATIO_RE = Regex("current hdr/sdr ratio=([0-9.]+)")
 
     private fun querySfLayerHdr(): Boolean? = try {
         val binder = Class.forName("android.os.ServiceManager")
@@ -2535,6 +2570,20 @@ object HdrBoostHook {
                             if (n > 0) {
                                 hit.set(true)
                                 break // 命中即停，不等全量 dump
+                            }
+                        }
+                        // 有的机型（Android 16 / ColorOS 平板实测）图层不带静态 HDR 元数据，
+                        // HDR 内容只体现为 PQ/BT2020 dataspace 或 SF 自己的 hdr/sdr 比值。
+                        if (line.contains(HDR_DATASPACE_MARK)) {
+                            hit.set(true)
+                            break
+                        }
+                        val r = HDR_RATIO_RE.find(line)
+                        if (r != null) {
+                            val v = r.groupValues[1].toFloatOrNull() ?: 0f
+                            if (v > 1.5f) {
+                                hit.set(true)
+                                break
                             }
                         }
                     }
@@ -2696,6 +2745,7 @@ object HdrBoostHook {
                         gateUntil = 0L
                         specFallback = false
                         hdrOffSince = 0L
+                        noContentSince = 0L
                         lastForcedRatio = Float.NaN
                     } else {
                         syncRatioCap()
@@ -2727,13 +2777,27 @@ object HdrBoostHook {
                         }
                         val focus = focusedWindowHdr()
                         val video = videoPlaying()
-                        val raw = when {
+                        val sfMeta = sfLayerHasHdrMetadata()
+                        val contentEvidence = video || sfMeta == true
+                        val base = when {
                             focus == true -> true
                             video -> true
                             focus == null -> hdrWindows.isNotEmpty() || sfHdrPlaying()
-                            else -> sfLayerHasHdrMetadata() == true || hdrWindows.isNotEmpty()
+                            else -> sfMeta == true || hdrWindows.isNotEmpty()
                         }
                         val nowMs = android.os.SystemClock.elapsedRealtime()
+                        // 窗口 colorMode / WMS 残留比内容晚很久才清：Android 16 / ColorOS 平板实测
+                        // 关掉 HDR 之后还能挺二十多秒，屏一直停在 HDR 亮度与高比值。
+                        // 只在「ColorOS 原生路径 + SF 明确没有 HDR 图层」时给一段有界宽限；
+                        // AOSP 专项链不受影响，SF 查询失败（null）时也不介入。
+                        val focusOnly = base && !contentEvidence && !aospMode && sfMeta == false
+                        val raw = if (focusOnly) {
+                            if (noContentSince == 0L) noContentSince = nowMs
+                            (nowMs - noContentSince) < HDR_FOCUS_ONLY_HOLD_MS
+                        } else {
+                            noContentSince = 0L
+                            base
+                        }
                         val want = if (!raw && hdrOn && aospMode) {
                             if (hdrOffSince == 0L) hdrOffSince = nowMs
                             (nowMs - hdrOffSince) < HDR_EXIT_HOLD_MS
@@ -2753,6 +2817,9 @@ object HdrBoostHook {
                             val gen = ++stateGen
                             val d = hdrEnhance
                             if (!specOn()) {
+                                // 退出时先放下厂商的提亮标志位，再走它自己的 checkIsPlayingHDR；
+                                // 否则 exitEnhanceBrightness() 之后后处理仍按旧标志继续提亮。
+                                if (!want) clearDriverEnhance(d)
                                 if (d != null) callPriv(d, "checkIsPlayingHDR")
                                 requestPowerUpdate()
                                 pushAospBrightness(want)
@@ -2777,6 +2844,7 @@ object HdrBoostHook {
                                 }
                             }
                             val why = when {
+                                focusOnly && !want -> "focus-only expired, no HDR layer"
                                 focus == true -> "focus=true"
                                 video -> "video playing"
                                 focus == null -> "fallback"

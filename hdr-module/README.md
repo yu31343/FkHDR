@@ -1,7 +1,7 @@
 # FkHDR — 独立 HDR 提亮修复模块
 
-> 当前版本：v1.7.2 / versionCode 29（libxposed API 102）。实现细节与 AOSP 基线见 [docs/aosp-alignment.md](../docs/aosp-alignment.md)。
-> 状态：v1.7.2 已在两台设备验收通过 —— Redmi 22041216C / Android 15 / HyperOS（专项链系统自算 ✔ 4.37）、一加平板 Pro OPD2404 / Android 16 / ColorOS（原生驱动 + GENERIC 兜底 ✔ 8.51）。静态作用域写在 APK 里，装好启用即可，无需手动勾选作用域。
+> 当前版本：v1.7.5 / versionCode 32（libxposed API 102）。实现细节与 AOSP 基线见 [docs/aosp-alignment.md](../docs/aosp-alignment.md)。
+> 状态：v1.7.5 已在两台设备验收通过 —— Redmi 22041216C / Android 15 / HyperOS（专项链系统自算 ✔ 4.37）、一加平板 Pro OPD2404 / Android 16 / ColorOS（原生驱动 + GENERIC 兜底 ✔ 8.51）。静态作用域写在 APK 里，装好启用即可，无需手动勾选作用域。
 
 | 项 | 值 |
 |---|---|
@@ -41,6 +41,22 @@ v1.7.0 换模块框架后出现三个真实问题，v1.7.1 与 v1.7.2 分别修�
 3. **第二台设备上模块完全不加载（静态作用域写错包名）**：`scope.list` 原来写 `android`。新版 LSPosed 会把 `android` 归一到 system_server 的伪包名 `system`，但旧版守护进程（一加平板 Pro 上的 2.2.1/7912）原样落库成 `android`，注入点因此落在一个并不存在的进程上，system_server 里一行模块日志都没有。改成 `system` 后静态作用域直接生效，装好启用即可，不必手动勾作用域。
 
 另有一处运维坑：`adb install -r` 后 LSPosed 记录的 `apkPath` 可能失效，模块会被静默跳过，需要 disable/enable 让 LSPosed 重写路径（见「安装」）。
+
+## v1.7.5：提亮倍数和压暗倍数对齐
+
+平板上出现过「提亮正常，但 SDR 部分没有压暗、整体偏亮」。根因是两个倍数不一致：
+
+- 厂商原生驱动把 nit 直接顶到面板上限：`99.39909 -> 846.09`，也就是 8.51 倍；
+- SurfaceFlinger 只按自己的 hdr/sdr ratio 压暗 SDR 层，那台机器上是 5.0 倍。
+
+提亮 8.51 倍、压暗 5.0 倍，SDR 就按 8.51/5.0 ≈ 1.7 倍偏亮。现在 `hookPostProcessBoost()` 在 `convertNitToBrightness()` 之前把 nit 收口到 `sdrNit × 上限`（上限就是 App 里的「比值封顶上限」），实测：
+
+```
+hdr nit clamped 846.09 -> 497.0 (ratio 8.51 -> cap 5.0)
+mgr pp ran nit=496.99548 sdrNit=99.39909 brightness=1660.9534
+```
+
+亮度从面板最大 2047 落到 1660.95，`dumpsys display` 的 `hdrSdrRatio` 同步变成 5.000007 —— 提亮倍数、SF 压暗倍数、界面显示的比值三者一致。上限还是实时可改：滑到 3.0，下一次后处理就把 nit 收到 `99.4 × 3.0`。
 
 ---
 
@@ -169,14 +185,14 @@ cd hdr-module
 
 ---
 
-## 实机验证（v1.7.2）
+## 实机验证（v1.7.3）
 
 设备：Redmi 22041216C / Android 15 / HyperOS / LSPosed 2.2.1（`lspctl status` 报 `apiVersion=102`）。验收 App：HDR能力检测 V0.7（`com.lns103.hdrCapability`）。
 
 ```text
 lspctl --json module show io.github.benbaobaoshigemi.fkhdr
   minApiVersion=102 targetApiVersion=102 legacy=false staticScope=true
-  declaredScope=["android","com.android.providers.settings"]
+  declaredScope=["com.android.providers.settings","system"]
 FkHDR:FkModule: loaded api=102 framework=LSPosed/2.2.1 systemServer=true process=system
 FkHDR:HdrFix: init done [platform=aosp bypass=1 aosp[dev=1 bright=1] hbm=true probe=1 ratioAvail=1 forge=1 dpc=true media=3 wms=2] factor=100.0
 FkHDR:HdrFix: ratio availability candidates=2 withUpdateDeviceInfo=1 hooked=1
@@ -192,6 +208,7 @@ FkHDR:SettingsProviderHook: initialized (module-only whitelist writes)
 - 播放 HDR 时 `dumpsys display` 的 `DisplayDeviceInfo` / `mBaseDisplayInfo` / `mOverrideDisplayInfo` 三处 `hdrSdrRatio` 都是有限值（空闲 1.0，HDR 时随内容变化），不再出现 `not_available`。
 - 验收 App 从「HDR SDR调光支持 ❌ / 比率 1.00000」变为「✔ / 4.37384」，与 bypass 日志的 4.37 一致 → 应用已注册监听并实时收到比值。
 - `setDisplayBrightness boost skipped (healthy specific chain)` 说明专项链（系统自算比值）在跑，GENERIC 亮度补偿主动让位；HDR 退出后仍按 1200ms 迟滞回落。
+- v1.7.3 复验（同一台手机，HDR 播放中点「HDR图片测试」）：`specific chain sdrHdrRatioSpline replaced (... Spline x=[2.0,650.0] y=[5.0,1.0])`、`HDR -> true(focus=true) [driver=null]`、`setDisplayBrightness boost skipped (healthy specific chain)`、`ratio bypass nits=55.6 sdrNits=22.1 -> 2.52`，`dumpsys display` 的 `hdrSdrRatio` 同步变化（1.4128228）—— 专项链在 v1.7.3 上仍然生效；上限滑块实测见上面的「比值封顶上限」小节（4.965725 → 2.0 → 4.2025065）。
 
 ### 第二台设备：一加平板 Pro（OPD2404，Android 16 / ColorOS，LSPosed 2.2.1 API 102）
 
