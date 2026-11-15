@@ -744,8 +744,12 @@ object HdrBoostHook {
         val mgr = XpHelpers.findClass(CLS_POST_MANAGER, classLoader)
         var n = hookAll(mgr, "convertNitToBrightness", object : XpHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
-                if (!enabled() || !hdrOn) return
+                if (!enabled()) return
                 val builder = param.args.getOrNull(0) ?: return
+                if (!hdrOn) {
+                    suppressStaleBoost(param.thisObject, builder)
+                    return
+                }
                 boost(param.thisObject, builder)
             }
         })
@@ -861,6 +865,35 @@ object HdrBoostHook {
 
     /** 通用兜底是否允许。设 0 则只走 ColorOS 原生驱动（用于验证原生链路）。 */
     private fun fallbackEnabled(): Boolean = prop2(PROP_FALLBACK, PROP_FALLBACK_OLD, "1") != "0"
+
+    /**
+     * HDR 已经关掉，但厂商驱动还在按自己的状态提亮。
+     *
+     * ColorOS 平板实测：验收 App 的窗口一直带着 HDR colorMode，OPPO 驱动不看 SF 里有没有
+     * HDR 图层，照样把 nit 顶到面板上限（99.4 -> 846.09），于是「关掉 HDR 之后比值继续往
+     * 5.0 爬、屏一直停在高亮度」，只有等自动亮度改一次亮度才会被重算回去。
+     * 这里在 SF 明确「没有 HDR 图层」时把 nit 按回 sdrNit，厂商自己的 ratio = nit/sdrNit
+     * 就归 1，亮度回到 SDR。SF 查询失败（null）时不动手，避免把真 HDR 误压。
+     */
+    private fun suppressStaleBoost(mgrOrNull: Any?, builder: Any): Boolean {
+        if (mgrOrNull == null) return false
+        if (hdrMetaCache != false) return false
+        return try {
+            val base = num(builder, "getNit")
+            val sdr = num(builder, "getSdrNit")
+            if (base.isNaN() || sdr.isNaN() || sdr <= 0f) return false
+            if (base / sdr <= 1.02f) return false
+            XpHelpers.callMethod(builder, "setNit", sdr)
+            logEvery("suppress_off", 1000L) {
+                "$TAG: hdr off but vendor boosting " + f2(base) + " -> sdr " +
+                    f2(sdr) + " (suppressed)"
+            }
+            true
+        } catch (t: Throwable) {
+            logEvery("suppressfail", 5000L) { "$TAG: suppress failed: " + t }
+            false
+        }
+    }
 
     private fun boost(mgrOrNull: Any?, builder: Any): Boolean {
         val mgr = mgrOrNull ?: return false
@@ -1440,7 +1473,13 @@ object HdrBoostHook {
                 logEvery("rationodev", 10000L) { "$TAG: force ratio skipped: no LocalDisplayDevice" }
                 return false
             }
-            if (findFieldUp(d.javaClass, "mCurrentHdrSdrRatio") == null) return false
+            if (findFieldUp(d.javaClass, "mCurrentHdrSdrRatio") == null) {
+                logEvery("ratiofieldmiss", 30000L) {
+                    "$TAG: ratio write unavailable: mCurrentHdrSdrRatio missing on " +
+                        d.javaClass.simpleName
+                }
+                return false
+            }
             val root = syncRootOf(d)
             if (root == null) {
                 logEvery("norootforce", 30000L) { "$TAG: sync root unavailable, refusing unlocked ratio write" }
@@ -1911,6 +1950,9 @@ object HdrBoostHook {
                 if (!enabled()) return
                 try {
                     val dev = param.thisObject ?: return
+                    // 先缓存设备实例：ColorOS 走的是厂商私有驱动，hookAospLocalDisplay
+                    // 那条捕获路径不会执行，退场时就没有对象可写比值。
+                    if (aospDev !== dev) aospDev = dev
                     if (findFieldUp(dev.javaClass, "mCurrentHdrSdrRatio") == null) return
                     val cur = XpHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
                     if (!cur.isNaN()) return
@@ -2751,15 +2793,27 @@ object HdrBoostHook {
                         syncRatioCap()
                         refreshSpecificMode()
                         val nowTail = android.os.SystemClock.elapsedRealtime()
-                        if (aospMode && !hdrOn && gateUntil != 0L && nowTail >= gateUntil) {
-                            gateUntil = 0L
-                            val cur = currentHdrSdrRatio()
-                            // NaN 是合法的「不可用」状态；只清理残留的有限旧比值，不伪装成 1.0。
-                            if (!cur.isNaN() && Math.abs(cur - 1f) > 0.05f) {
-                                if (forceHdrSdrRatio(aospDev, 1.0f)) {
-                                    lastForcedRatio = 1.0f
-                                    lastForceAt = nowTail
-                                    Xp.log("$TAG: ratio tail-restore 1.0 (was " + f2(cur) + ")")
+                        // HDR 结束后的比值回落。
+                        // ColorOS 原生路径只在 DisplayPowerController 推新 nits 时才会重算
+                        // handleHdrSdrNitsChanged，所以「关掉 HDR 后比值停在 5.0，直到自动亮度
+                        // 触发一次亮度更新才回落」是它的固有行为（实测：开启后立即关闭，比值先被
+                        // 迟到的提亮写到 5.0，再一直挂着）。
+                        // 退出窗口内主动把比值写回 1.0，并且持续纠正到窗口结束——迟到的提亮可能
+                        // 再把高比值写回来，只在退出那一刻写一次是不够的。
+                        if (!hdrOn && gateUntil != 0L) {
+                            if (nowTail >= gateUntil) {
+                                gateUntil = 0L
+                            } else {
+                                val cur = currentHdrSdrRatio()
+                                // NaN 是合法的「不可用」状态；只清理残留的有限旧比值，不伪装成 1.0。
+                                if (!cur.isNaN() && Math.abs(cur - 1f) > 0.05f &&
+                                    nowTail - lastForceAt >= FORCE_MIN_INTERVAL_MS
+                                ) {
+                                    if (forceHdrSdrRatio(aospDev, 1.0f)) {
+                                        lastForcedRatio = 1.0f
+                                        lastForceAt = nowTail
+                                        Xp.log("$TAG: ratio restored 1.0 on HDR exit (was " + f2(cur) + ")")
+                                    }
                                 }
                             }
                         }
@@ -2780,6 +2834,11 @@ object HdrBoostHook {
                         val sfMeta = sfLayerHasHdrMetadata()
                         val contentEvidence = video || sfMeta == true
                         val base = when {
+                            sfMeta == true -> true
+                            // ColorOS 上窗口 colorMode 是残留信号：关掉 HDR 之后还能再挺 20-30 秒，
+                            // 光靠它会和 focus-only 宽限互相拉扯，状态每几秒翻一次、每次翻都重新
+                            // 提亮一次比值。SF 明确说没有 HDR 图层时就以 SF 为准。
+                            !aospMode && sfMeta == false -> false
                             focus == true -> true
                             video -> true
                             focus == null -> hdrWindows.isNotEmpty() || sfHdrPlaying()

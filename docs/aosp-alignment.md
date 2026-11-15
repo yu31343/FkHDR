@@ -1,8 +1,8 @@
 # AOSP 对齐记录（HDR / hdrSdrRatio）
 
-> 当前实现：FkHDR v1.7.5（versionCode 32，libxposed API 102）。审查对象是 `hdr-module/`；`module/`（legacy API 82）只作历史参考。
+> 当前实现：FkHDR v1.7.6（versionCode 33，libxposed API 102）。审查对象是 `hdr-module/`；`module/`（legacy API 82）只作历史参考。
 > 设计原则：GENERIC 兜底和 watcher 始终安装；专项链路只是运行时健康开关；不把启动期静态探测当作永久事实。
-> 验证状态：静态审查、Kotlin 编译与 clean release 构建通过；v1.7.5 在两台设备验收通过 —— Redmi 22041216C / Android 15（专项链系统自算）与一加平板 Pro OPD2404 / Android 16 / ColorOS（原生驱动 + GENERIC 兜底），跨 ROM 缺口见 §8。
+> 验证状态：静态审查、Kotlin 编译与 clean release 构建通过；v1.7.6 在两台设备验收通过 —— Redmi 22041216C / Android 15（专项链系统自算）与一加平板 Pro OPD2404 / Android 16 / ColorOS（原生驱动 + GENERIC 兜底，关掉 HDR 后比值 2 秒内回落），跨 ROM 缺口见 §8。
 
 ## 1. AOSP Android 15 契约
 
@@ -125,6 +125,29 @@ mgr pp ran nit=496.99548 sdrNit=99.39909 brightness=1660.9534
 
 收口后亮度从 2047（面板最大）降到 1660.95，`dumpsys display` 的 `hdrSdrRatio` 也变成 5.000007：模块提亮倍数 == SF 压暗倍数 == 界面读到的比值。上限仍由 §4.7 的实时机制控制，滑到 3.0 下一次后处理就按 3 倍收口。
 
+### 4.9 HDR 退出后比值必须主动回落（v1.7.6）
+
+ColorOS 设备上出现过「HDR 关了，`hdrSdrRatio` 仍停在 5.0，必须等自动亮度改一次亮度才降」。这不是 watcher 的迟滞太长，而是两个独立问题：
+
+1. **窗口 `colorMode` 是残留信号**：HDR 关掉后窗口属性仍带 HDR colorMode，watcher 每 5 秒左右在 `HDR -> true(focus=true)` 与 `HDR -> false(focus-only expired, no HDR layer)` 之间翻，每翻回 true 就重新提亮一次。
+2. **厂商驱动不看 SF 图层**：ColorOS 的 `OplusFeatureHDREnhanceBrightness` 后处理只要被叫醒就把 nit 顶到面板上限，与 SF 里是否真有 HDR 图层无关（`hdr nit clamped 846.09 -> 497.0`）。模块原本只在 `hdrOn` 时管亮度，退出后既不按回 SDR，也不主动写比值；而厂商 `handleHdrSdrNitsChanged(float,float)` 只在亮度变化时重算，于是比值一直挂着。
+
+v1.7.6 的三个改动：
+
+- HDR 判定改为「SF 图层证据优先」：`sfLayerHasHdrMetadata()` 的 `sfMeta` 为 `true` 就是 HDR；为 `false` 且非 AOSP 栈就不是 HDR；只有 `null`（读不到 SF 状态）才回落到窗口 colorMode、媒体会话与 `hdrWindows`。SF 证据来自 `dataspace=0x188a`（BT2020/PQ）与 `current hdr/sdr ratio > 1.5`，都是 SF dump 里的真实字段，不受窗口属性残留影响。
+- 新增 `suppressStaleBoost()`：`hdrMetaCache == false`（SF 明确没有 HDR 图层）且驱动把 `getNit()/getSdrNit()` 抬到 1.02 以上时，`setNit(getSdrNit())` 把亮度按回 SDR，日志 `hdr off but vendor boosting X -> sdr Y (suppressed)`。它挂在 `convertNitToBrightness()` before 钩子里 `!hdrOn` 的分支，AOSP 栈不走厂商驱动时自然不触发。
+- 退出回落改成所有平台都做：`!hdrOn && gateUntil != 0L` 时，过了 `HDR_EXIT_HOLD_MS`（1200ms）就清 gate，否则每 `FORCE_MIN_INTERVAL_MS`（500ms）读一次 `currentHdrSdrRatio()`，`|ratio - 1| > 0.05` 就 `forceHdrSdrRatio(aospDev, 1.0f)`，日志 `ratio restored 1.0 on HDR exit (was X)`。原来这段只在 `aospMode` 下生效，ColorOS 栈因此永远不主动写回。
+
+平板实测（一加平板 Pro / Android 16 / ColorOS，验收 App 开 HDR 6 秒后关闭）：
+
+```text
+on+6s  hdrSdrRatio 5.000007  brightness 1660
+t+1    4.6617727             1540
+t+2    1.0                   718
+```
+
+1 秒内快速开/关：`t+1 1.28 → t+2 1.82 → t+3 2.52 → t+4 起恒 1.0`。真 HDR 视频（探针播放器）：`play+2 1.68 → play+5 5.000007`，`stop+4 3.59 → stop+5 1.0`。第二台设备（手机 / AOSP 栈）行为不变：专项链照常，退出仍按原路径回落。
+
 ## 5. 跨设备行为
 
 | 设备形状 | 当前行为 |
@@ -207,6 +230,10 @@ libxposed 对同一 `Executable` 用同一 id 重复装钩子做的是原子替�
 
 排查方法：拉 `/data/adb/lspd/config/modules_config.db`，看 `scope` 表里该模块的 system_server 行必须是 `system`。改成 `system` 后静态作用域直接生效，不需要手动勾选；改完要让配置重新落库（重新启用模块 + 重启设备）。
 
+### 坑 7：ColorOS 的窗口 colorMode 是残留信号，不能单独当 HDR 判据
+
+HDR 内容关掉之后，窗口属性里的 colorMode 可能还带着 HDR（实测残留几十秒），按它判定就会反复「重新开启 HDR → 再退出」。这类设备上要靠 SF 的图层证据（`dataspace=0x188a`、`current hdr/sdr ratio`）判 HDR，窗口属性只在读不到 SF 状态时兜底。另一个后果：厂商驱动不看 SF 图层，照样抬 nit，所以退出时既要压回 nit，也要主动把比值写回 1.0（见 §4.9）。
+
 ### v1.6.1 历史实测（不是 v1.6.2 验收）
 
 仓库曾记录一次 Redmi xaga / HyperOS 3 / Android 15 的 HDR10 读数：播放时 `hdrSdrRatio=3.5368757`、`mScreenBrightness=0.013215097`、`hbmMode=hdr`；停止后 `1.0`、`0.0034099757`、`off`，验收 App 显示 ✔️。该记录没有附带可复查的 logcat / dumpsys 文件，且来自旧实现；不能据此声称 v1.6.2 已实机通过。
@@ -218,7 +245,7 @@ libxposed 对同一 `Executable` 用同一 id 重复装钩子做的是原子替�
 - 7 个非重叠切片 reviewer + 1 个 AOSP android15 基线复核，原始结论均为 ISSUES，修复逐条对应。
 - 延迟送达的 final-review 报 R1–R5（亮度量纲、SettingsProvider 嵌套标记、开关关闭写驱动、诊断 readback、注释矛盾），逐项复核后已修复；verifier 的 6 项检查为 PASS、1 条 nit 与 final-review R2 同源。
 - 终审修正后 `:app:compileReleaseKotlin`、`:app:clean :app:assembleRelease --offline`、`git diff --check` 与 `aapt2 dump badging` 全部通过。
-- 版本号 `versionCode = 30` / `versionName = "1.7.3"`，`android.suppressUnsupportedCompileSdk=37` 与 `compileSdk = 37` 一致。
+- 版本号 `versionCode = 33` / `versionName = "1.7.6"`，`android.suppressUnsupportedCompileSdk=37` 与 `compileSdk = 37` 一致。
 
 已完成的实机验证（Redmi 22041216C / Android 15 / HyperOS / LSPosed 2.2.1，框架 apiVersion=102）：
 
@@ -234,6 +261,7 @@ libxposed 对同一 `Executable` 用同一 id 重复装钩子做的是原子替�
 
 仍存在的 GAP：
 
+- v1.7.6 退出回落实测（一加平板 Pro / Android 16 / ColorOS）：验收 App 开 HDR 6 秒后关闭，`hdrSdrRatio` 从 5.000007 降到 4.6617727（t+1）、1.0（t+2），`screen_brightness` 1660 → 1540 → 718；1 秒内快速开/关后 `t+4` 起恒为 1.0；真 HDR 视频停止后 `stop+4 3.59 → stop+5 1.0`。日志侧伴随 `hdr off but vendor boosting ... (suppressed)` 与 `ratio restored 1.0 on HDR exit (was ...)`。
 - 已在两台设备验证：Android 15 / HyperOS 手机（AOSP 栈专项链）与 Android 16 / ColorOS 平板（无 spline，走原生驱动 + GENERIC）；其它 ROM、其它 LSPosed 版本与无 root 场景未测。
 - Android 16 平板上 `sdrToHdrRatioSpline=false`，专项链在该机型未验证（只有 GENERIC 与原生驱动）。
 - 未在多种 ROM 上验证拦截器链与 legacy before/after 的顺序差异、合成字段命名、厂商 `SettingsProvider` 行为和 SF dump 输出。

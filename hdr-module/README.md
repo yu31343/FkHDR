@@ -1,7 +1,7 @@
 # FkHDR — 独立 HDR 提亮修复模块
 
-> 当前版本：v1.7.5 / versionCode 32（libxposed API 102）。实现细节与 AOSP 基线见 [docs/aosp-alignment.md](../docs/aosp-alignment.md)。
-> 状态：v1.7.5 已在两台设备验收通过 —— Redmi 22041216C / Android 15 / HyperOS（专项链系统自算 ✔ 4.37）、一加平板 Pro OPD2404 / Android 16 / ColorOS（原生驱动 + GENERIC 兜底 ✔ 8.51）。静态作用域写在 APK 里，装好启用即可，无需手动勾选作用域。
+> 当前版本：v1.7.6 / versionCode 33（libxposed API 102）。实现细节与 AOSP 基线见 [docs/aosp-alignment.md](../docs/aosp-alignment.md)。
+> 状态：两台验收设备都已升级到 v1.7.6 —— Redmi 22041216C / Android 15 / HyperOS（专项链系统自算）、一加平板 Pro OPD2404 / Android 16 / ColorOS（原生驱动 + GENERIC 兜底，关掉 HDR 后比值 2 秒内回落）。静态作用域写在 APK 里，装好启用即可，无需手动勾选作用域。
 
 | 项 | 值 |
 |---|---|
@@ -57,6 +57,29 @@ mgr pp ran nit=496.99548 sdrNit=99.39909 brightness=1660.9534
 ```
 
 亮度从面板最大 2047 落到 1660.95，`dumpsys display` 的 `hdrSdrRatio` 同步变成 5.000007 —— 提亮倍数、SF 压暗倍数、界面显示的比值三者一致。上限还是实时可改：滑到 3.0，下一次后处理就把 nit 收到 `99.4 × 3.0`。
+
+## v1.7.6：HDR 关掉之后比值要马上回落
+
+ColorOS 平板上出现过「HDR 已经关了，比率还挂在 5.0，要等自动亮度动一下才降」。两条原因叠在一起：
+
+1. **窗口的 `colorMode` 是残留信号**。HDR 关掉后窗口仍带 HDR colorMode，watcher 每 5 秒左右在「有 HDR」和「没有 HDR」之间翻一次，每翻回去就重新提亮一次。
+2. **厂商驱动不看 SF 有没有 HDR 图层**，照样把 nit 顶到面板上限（`846.09`）。模块只在 HDR 开启时管亮度，退出后既没把 nit 按回 SDR，也没主动重写比值；驱动自己的 `handleHdrSdrNitsChanged()` 只在亮度变化时重算，于是比值一直挂着。
+
+改法：
+
+- HDR 判定优先采信 SF 的图层证据（`dataspace=0x188a`、`current hdr/sdr ratio`）：`sfMeta == true` 就是 HDR，`sfMeta == false` 且不是 AOSP 栈就不是 HDR，两者都拿不到才回落到窗口 colorMode、媒体会话与 `hdrWindows`。
+- 新增 `suppressStaleBoost()`：HDR 已退出但驱动仍在抬 nit 时，把 nit 直接限回 `sdrNit`，日志 `hdr off but vendor boosting X -> sdr Y (suppressed)`。
+- HDR 退出时所有平台都主动把比值写回 1.0（原来只有 AOSP 栈做）；每 500ms 查一次，`|ratio - 1| > 0.05` 就写，日志 `ratio restored 1.0 on HDR exit (was X)`。
+
+平板实测（一加平板 Pro / Android 16 / ColorOS），开启 6 秒再关闭：
+
+```text
+on+6s  hdrSdrRatio 5.000007  brightness 1660
+t+1    4.6617727             1540
+t+2    1.0                   718
+```
+
+1 秒内快速开/关：`t+1 1.28 → t+2 1.82 → t+3 2.52 → t+4 起恒 1.0`，不再反复弹回。真 HDR 视频：`play+2 1.68 → play+5 5.000007` 保持，`stop+4 3.59 → stop+5 1.0`。
 
 ---
 
@@ -185,7 +208,7 @@ cd hdr-module
 
 ---
 
-## 实机验证（v1.7.3）
+## 实机验证（v1.7.6）
 
 设备：Redmi 22041216C / Android 15 / HyperOS / LSPosed 2.2.1（`lspctl status` 报 `apiVersion=102`）。验收 App：HDR能力检测 V0.7（`com.lns103.hdrCapability`）。
 
