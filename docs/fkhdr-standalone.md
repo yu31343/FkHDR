@@ -1,5 +1,7 @@
 # HDR 功能拆分：独立模块 FkHDR
 
+> ⚠️ 历史记录（截至 v1.6.1）：本文的字段名、版本号、日志样例与实现结论只描述当时的样本；当前 FkHDR v1.6.2 的行为以 [AOSP 对齐记录](aosp-alignment.md) 与 [hdr-module/README.md](../hdr-module/README.md) 为准。
+
 > 2026-10-25。用户确认 v1.9.3 在类原生（LineageOS 23）上生效后，
 > 把 HDR 提亮从 FkOScreen 拆成**独立 LSPosed 模块**，解决"兼容性"与"分发"两个问题。
 

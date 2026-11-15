@@ -9,22 +9,10 @@
         android:allowBackup="true"
         android:icon="@android:drawable/ic_menu_manage"
         android:label="@string/app_name"
+        android:description="@string/module_description"
         android:roundIcon="@android:drawable/ic_menu_manage"
         android:supportsRtl="true"
         android:theme="@style/Theme.FkHDR">
-
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-        <meta-data
-            android:name="xposeddescription"
-            android:value="FkHDR · HDR 提亮修复：HDR 内容出现时把面板推到物理最大亮度，并上报真实的 HDR/SDR 比值" />
-        <meta-data
-            android:name="xposedminversion"
-            android:value="82" />
-        <meta-data
-            android:name="xposedscope"
-            android:resource="@array/xposed_scope" />
 
         <activity
             android:name=".ui.MainActivity"

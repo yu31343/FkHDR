@@ -1,117 +1,149 @@
 # FkHDR — 独立 HDR 提亮修复模块
 
-> 从 FkOScreen 拆出来的**单一职责**模块：只做一件事 —— 让不支持的设备在播放 HDR 内容时
-> 真正把面板推到物理最大亮度，并让系统上报**真实的 HDR/SDR 比值**。
+> 当前版本：v1.7.2 / versionCode 29（libxposed API 102）。实现细节与 AOSP 基线见 [docs/aosp-alignment.md](../docs/aosp-alignment.md)。
+> 状态：v1.7.2 已在两台设备验收通过 —— Redmi 22041216C / Android 15 / HyperOS（专项链系统自算 ✔ 4.37）、一加平板 Pro OPD2404 / Android 16 / ColorOS（原生驱动 + GENERIC 兜底 ✔ 8.51）。静态作用域写在 APK 里，装好启用即可，无需手动勾选作用域。
 
 | 项 | 值 |
 |---|---|
 | 包名 | `io.github.benbaobaoshigemi.fkhdr` |
-| 入口 | `io.github.fkhdr.HookInit` |
-| 作用域 | **只挂 system_server**（+ SettingsProvider 用于写开关） |
-| 依赖 | 无（不用 Compose、不用 androidx） |
+| 入口 | `io.github.fkhdr.FkModule`（注册在 `META-INF/xposed/java_init.list`） |
+| 作用域 | `META-INF/xposed/scope.list`：`system`（system_server 的伪包名，不能写 `android`）+ `com.android.providers.settings`（免 root 写开关/上限），`staticScope=true` |
+| 依赖 | `io.github.libxposed:api:102.0.0`（compileOnly，运行时由框架提供）；不用 Compose、不用 androidx |
 
 ---
 
 ## 为什么独立
 
-原 FkOScreen 模块把 HDR 提亮和「亮度上限解除 / 深色模式三档 / 色温球 / 144Hz / 护眼」等
-十来个 ColorOS 专属功能塞在一起，带来两个问题：
-
-1. **兼容性差**：非 ColorOS 系统（LineageOS / PE / GSI / HyperOS）加载模块时会为每个
-   OPPO 私有类打一堆 `ClassNotFoundException`，噪音大、也不好判断到底哪个功能在起作用。
-2. **难以分发**：只想修 HDR 的用户被迫装上整个 ColorOS 工具箱。
-
-FkHDR 只保留 HDR 这一条链，并按平台严格分级，不在别的系统上挂不属于它的 hook。
+原 FkOScreen 模块把 HDR 提亮和多个 ColorOS 专属功能放在一起。FkHDR 只负责 HDR 链，并在 AOSP 分支始终保留 GENERIC 兜底，避免只依赖某一种 ROM 的私有字段。
 
 ---
 
-## 支持的系统
+## 支持与兜底
 
-| 平台 | 判定依据 | 走的通路 |
+| 平台 | 主链路 | 兜底 |
 |---|---|---|
-| **ColorOS 16 / 17**（一加 / OPPO / realme 官方 ROM） | 存在 `OplusFeatureConfigManagerService` 或 `com.oplus.content.OplusFeatureConfigManager` | OPPO 原生提亮驱动 `OplusFeatureHDREnhanceBrightness`（自带动画/硬件 clamp，质量最好）+ 后处理兜底 |
-| **类原生**（LineageOS / PixelExperience / GSI / HyperOS 等） | 存在 `com.android.server.display.LocalDisplayAdapter` | AOSP 显示栈主动推送：`requestDisplayStateLocked` 改写 + 自算 `handleHdrSdrNitsChanged` |
-| **其他** | 都不存在 | 只挂通用链路（DPC / WMS / 媒体会话 / HDR 检测），不碰任何私有类 |
+| ColorOS / 一加 / OPPO / realme | OEM 原生提亮驱动、后处理与 feature 钩子 | OPPO 通路全部失配时启用 AOSP 兜底 |
+| 类原生 / AOSP 显示栈 | 运行时验证成功后使用专项链（spline + 比值接管） | **始终安装** request/state 捕获、亮度注入、比值发布、媒体/WMS 检测与 watcher |
+| 其他 | 通用 DPC / WMS / 媒体会话 / HDR 检测 | 找不到私有字段时不写系统状态，保持原路径 |
+
+专项链只是运行时优化开关：`splineInstalled`、`ratioBypassInstalled`、`ratioBypassVerified` 全部成立才抑制 GENERIC 补偿；任一环节失败、曲线被系统换回、或 2 秒内仍没有有限有效比值，watcher 退回 GENERIC。
+
+AOSP 分支不再强制 `isSupportSdrToHdrRatio()`，也不再写 `mSupportUltraHDR` / `mForceSurfaceControl`。比值不可用时系统内部保持 `Float.NaN`，但重建 `DisplayDeviceInfo` 之前会把 NaN 归一成 `1.0`：AOSP 的 `Display.isHdrSdrRatioAvailable()` 就是 `!Float.isNaN(hdrSdrRatio)`，不归一的话应用侧永远看到「不支持」、永远不注册监听器，专项链写进去的真实比值也没人消费（v1.7.0 就是这样把 v1.6.1 的 ✔ 弄丢的）。ColorOS 分支的 OPPO Ext feature 钩子与 HBM 控制器字段是另一套设计，不能和 AOSP 比率闸门混为一谈。
+
+---
+
+## v1.7.1 / v1.7.2 修了什么
+
+v1.7.0 换模块框架后出现三个真实问题，v1.7.1 与 v1.7.2 分别修掉：
+
+1. **应用侧「HDR SDR调光支持」变 ❌**：v1.6.2 审查时删掉了「比值未知就归一成 1.0」的钩子，系统回报 `hdrSdrRatio = NaN`，`isHdrSdrRatioAvailable()` 为 false，验收 App 显示 ❌ + 比率 1.00000。现在由 `hookRatioAvailability()` 在 `LocalDisplayDevice.updateDeviceInfoLocked()` 之前把 NaN 归一成 1.0（AOSP 自己的下界，表示 HDR 与 SDR 同亮度）；HDR 播放时仍写真实比值。
+2. **专项链永不启用、只剩 GENERIC 兜底**：`xp/Xp.kt` 的 hook id 只由「类名 + 方法名 + 参数表」拼成，而 `hookAospRatioBypass` 与 `hookRatioProbeOnly` 挂的是同一个 `handleHdrSdrNitsChanged(float,float)`；libxposed 对同 id 是原子替换，后装的只读 probe 把 bypass 顶掉，`ratioBypassVerified` 永远 false → `updateSpecificMode()` 永远 false → `chain` 停在 GENERIC。现在 id 末尾追加 hook 站点类名（匿名类每处唯一），不同钩子共存、同一处重装仍幂等。
+3. **第二台设备上模块完全不加载（静态作用域写错包名）**：`scope.list` 原来写 `android`。新版 LSPosed 会把 `android` 归一到 system_server 的伪包名 `system`，但旧版守护进程（一加平板 Pro 上的 2.2.1/7912）原样落库成 `android`，注入点因此落在一个并不存在的进程上，system_server 里一行模块日志都没有。改成 `system` 后静态作用域直接生效，装好启用即可，不必手动勾作用域。
+
+另有一处运维坑：`adb install -r` 后 LSPosed 记录的 `apkPath` 可能失效，模块会被静默跳过，需要 disable/enable 让 LSPosed 重写路径（见「安装」）。
+
+---
+
+## 模块框架：libxposed API 102
+
+模块按新版 libxposed 规范实现，不再使用 legacy 的 `de.robv.android.xposed:api:82`。
+
+| 项 | 值 |
+|---|---|
+| 入口类 | `io.github.fkhdr.FkModule`（继承 `io.github.libxposed.api.XposedModule`） |
+| 注册 | `META-INF/xposed/java_init.list`（一行一个全限定类名） |
+| 元数据 | `META-INF/xposed/module.prop`：`minApiVersion=102`、`targetApiVersion=102`、`staticScope=true`、`exceptionMode=protective` |
+| 作用域 | `META-INF/xposed/scope.list` |
+| 依赖 | `io.github.libxposed:api:102.0.0`（compileOnly） |
+
+- 生命周期：`onModuleLoaded` 记日志 → `onSystemServerStarting` 挂 HDR 主链 → `onPackageLoaded` 在 `com.android.providers.settings` 出现时挂设置白名单。
+- API 102 不允许再引用 `de.robv.android.xposed` 的任何类，所以原来的 `XC_MethodHook` before/after 钩子由 [xp/XpHook.kt](app/src/main/java/io/github/fkhdr/xp/XpHook.kt) 适配到拦截器链（`chain.proceed()` 前后执行）；[xp/Xp.kt](app/src/main/java/io/github/fkhdr/xp/Xp.kt) 提供 `hookAllMethods`/`hookAllConstructors`/`log`，[xp/XpHelpers.kt](app/src/main/java/io/github/fkhdr/xp/XpHelpers.kt) 替代 `XposedHelpers`。
+- 钩子 id 是 `"fkhdr:" + 类名 + "#" + 方法名 + 参数表 + "@" + hook 站点类名`：同一处重装是原子替换（`init` 重跑不叠层），不同源码点挂在同一个 `Executable` 上也能共存。少了末尾的站点类名，后装的钩子会把先装的顶掉（v1.7.0 的 bypass 就是这样被只读 probe 替换掉的）。
+- `SettingsProvider` 不在 `onSystemServerStarting` 里挂：Android 13+ 它跑在 system_server 内，但类在它自己的 APK classloader 里，必须等 `onPackageLoaded` 拿到 `defaultClassLoader`。
+- 热重载未启用（`autoHotReload` 未声明）；模块更新后仍需重启设备或重启 system_server。
 
 ---
 
 ## 安装
 
-1. 装 APK
-2. LSPosed 里启用，**作用域只勾「系统框架」**（`android`）
-   - 若想让界面里的开关免 root 生效，再勾 `com.android.providers.settings`
-3. 重启设备（或重启 system_server）
+1. 安装 APK。需要支持 libxposed API 102 的框架（LSPosed 2.x，`lspctl status` 的 `apiVersion` 应为 102）。
+2. 在 LSPosed 启用模块；作用域来自 APK 内的 `scope.list`（`staticScope=true`），正常无需手动勾选。system_server 那条必须写 `system`，写 `android` 只在部分 LSPosed 版本上被自动归一（见上文第 3 条）。
+3. 重启设备或重启 system_server。
+4. 每次 `adb install -r` 后核对 LSPosed 记录的 APK 路径与 API 版本：
 
-> 与原 FkOScreen 模块**可以共存**：两边逻辑都是幂等的（都把亮度推到同一个上限、
-> 都算同一个比值），只是日志会重复。两者共用 `Settings.System:hdr_ratio_fix` 这个开关键，
-> 所以关掉任意一个界面里的开关，两边都会关。
+```bash
+pm path io.github.benbaobaoshigemi.fkhdr
+lspctl --json module show io.github.benbaobaoshigemi.fkhdr
+```
+
+若 `apkPath` 与 `pm path` 不一致，模块会被静默跳过：system_server 里没有任何日志，LSPosed 侧只有 `Failure to parse package archive /data/app/~~.../base.apk`。让 LSPosed 重写路径：
+
+```bash
+lspctl --json module disable io.github.benbaobaoshigemi.fkhdr --user 0
+lspctl --json module enable  io.github.benbaobaoshigemi.fkhdr --user 0
+su -c 'killall system_server'
+```
+
+只 `killall system_server` 不够，必须 disable/enable 一次。
 
 ---
 
 ## 开关
 
-优先级：系统属性 > 模块界面开关。
+优先级：系统属性 > 模块界面开关。界面写入 `hdr_ratio_fix` 与 `hdr_ratio_max`；两者都在 [SettingsProviderHook.kt](app/src/main/java/io/github/fkhdr/hooks/SettingsProviderHook.kt) 的模块白名单内。白名单写调用用 `MethodHookParam` extra 配对 before/after，权限检查只认调用栈标记与 `args[2] = callingPackage`，限制变更仍按 setting key 复核。
 
 | 属性 | 默认 | 说明 |
 |---|---|---|
-| `persist.sys.fkhdr.fix` | 开 | `0` = 关闭整个模块 |
-| `persist.sys.fkhdr.factor` | 100 | 提亮倍数，最终由面板 nit 上限截断 |
-| `persist.sys.fkhdr.ratio_max` | 自动 | 人工指定 HDR/SDR 比值上限；不设则按面板物理上限 |
+| `persist.sys.fkhdr.fix` | 开 | `0` = 关闭整个模块；所有状态写入、提亮请求、watcher 与延迟写入都会复查，关闭期间清空 HDR 判定缓存 |
+| `persist.sys.fkhdr.factor` | 100 | 提亮倍数，由面板 nit 上限截断 |
+| `persist.sys.fkhdr.ratio_max` | 5.0 | 亮度目标与 spline 端点上限；**不用于截断 AOSP 原始比值** |
 | `persist.sys.fkhdr.native` | 1 | `0` = 不用 OPPO 原生驱动 |
-| `persist.sys.fkhdr.fallback` | 1 | `0` = 不用通用兜底 |
+| `persist.sys.fkhdr.fallback` | 1 | `0` = 关闭 ColorOS 后处理兜底 |
 | `persist.sys.fkhdr.video` | 1 | `0` = 不把视频播放算作 HDR 场景 |
-| `persist.sys.fkhdr.hbm` | 1 | `0` = 不强制进 HBM（只提亮到常规最大亮度） |
-| `persist.sys.fkhdr.aosp_force` | 0 | `1` = 在 ColorOS 上也强行走 AOSP 通路（调试用） |
+| `persist.sys.fkhdr.hbm` | 1 | `0` = 不主动进 HBM |
+| `persist.sys.fkhdr.aosp_force` | 0 | `1` = 在 ColorOS 上也强制走 AOSP 通路（调试用） |
 
-**从旧模块迁移**：上述属性会自动回落读取 `persist.sys.fkoscreen.hdr_*` 旧名字，
-不需要重新 setprop。
-
----
-
-## 工作原理（三句话）
-
-- **ColorOS**：模块缺的 3 个 OPPO feature 由模块注入，让系统自带的
-  `OplusFeatureHDREnhanceBrightness` 正常进亮度后处理链；它自己算 nit、自己走动画。
-- **类原生**：AOSP 的比值闸门 `hasSdrToHdrRatioSpline()` 在本类面板上是 false，
-  且该调用点会被 ART 内联（hook 不生效），所以模块**自己算**：
-  `brightnessToBacklight → backlightToNits → handleHdrSdrNitsChanged`。
-- **类原生 · HBM**：很多 ROM 的 HDR 提亮最终靠 `HighBrightnessModeController` 进 HBM，
-  而它的触发条件是 `mIsHdrLayerPresent`（由 SF 的 HDR 图层面积决定）。
-  模块在 HDR 期间直接置位并调 `updateHbmMode()`，等效于「改 displayconfig + 删 jar 门禁」
-  那类模块，但不需要动任何系统文件。
-- **共同点**：HDR 内容出现时把 `brightnessState` 抬到 `1.0`（面板物理最大），
-  `sdrBrightnessState` 保留用户亮度；内容结束立刻回落。无白名单，只看内容不看包名。
+旧属性 `persist.sys.fkoscreen.hdr_*` 会自动回落读取。UI 在后台线程持久化并回读；失败时提示检查两个 LSPosed 作用域或授予 root。
 
 ---
 
-## 日志判读（LSPosed 管理器 → 日志）
+## 工作原理
 
-启动时应有：
+1. **HDR 判定**：焦点窗口、正在播放的媒体会话、SurfaceFlinger 图层 HDR 元数据；退出有 1200ms 迟滞。
+2. **GENERIC 兜底**：捕获设备与亮度请求，按精确 `(float)->float` 签名解析 nits 链，必要时在 `DisplayAdapter` 的 SyncRoot 下发布比值。拿不到锁就放弃写入，不无锁刷新 DeviceInfo。
+3. **专项链**：兼容 AOSP15 `mSdrToHdrRatioSpline` 与 OEM `mHbmData/mHdrBrightnessData.sdrToHdrRatioSpline` 两种形状；x 轴来自运行时面板 nits，曲线工厂优先 `createMonotoneCubicSpline`，再回退 `createLinearSpline`。
+4. **比值语义**：有效输入为 `max(1, nits/sdrNits)` 且不人为封顶；无效输入保留 `Float.NaN`。`Display.isHdrSdrRatioAvailable()` 用 `!Float.isNaN(...)` 判可用，所以 NaN 是合法状态。
+5. **自愈**：watcher 每 400ms 运行、每 3 秒自检；开关关闭时清 pendingRatio / HDR 状态，专项链失效时降级，曲线被换回时重装。
+6. **量纲安全**：亮度目标由 `aospBoostTarget()` 统一计算；只有曲线有效、clamp 后仍高于 SDR 白点时才提亮。曲线不可用或厂商绝对量纲(0..2047)与 framework 0..1 不一致时保持系统原值，不硬推 `1.0`。
 
-```
-FkHDR:HookInit: hooking system_server
-FkHDR:HdrFix: init done [platform=... forge=1 dpc=1 media=3 wms=1] factor=100.0
-```
+---
 
-类原生上播放 HDR 时应依次出现：
+## 日志判读
 
-```
-FkHDR:HdrFix: brightness hook installed on ...LocalDisplayDevice$1 (1 method)
-FkHDR:HdrFix: aosp funnel alive (state=2 brightness=0.39 sdr=0.39 useSurfaceControlBrightness=true)
-FkHDR:HdrFix: HDR -> true(focus=true) [driver=null]
-FkHDR:HdrFix: aosp push applied brightness=1.0 sdr=0.39 state=2
-FkHDR:HdrFix: ratio direct nits=2047.0 sdrNits=800.0 -> ratio=2.56 current=2.56
-FkHDR:HdrFix: HDR -> false(focus=false) [driver=null]
-FkHDR:HdrFix: aosp push applied brightness=0.39 sdr=0.39 state=2
+启动：`init done [platform=... bypass=... aosp[dev=... bright=...] hbm=... probe=... forge=... dpc=... media=... wms=...] factor=...`。
+
+```text
+FkHDR:HdrFix: ratio bypass installed on N method(s)
+FkHDR:HdrFix: ratio bypass target missing; GENERIC fallback stays active
+FkHDR:HdrFix: specific chain sdrHdrRatioSpline replaced (shape ... x=[...] y=[...])
+FkHDR:HdrFix: chain -> SPECIFIC(系统自算) / GENERIC(模块代劳) [spline=... bypass=... verified=... fallback=...]
+FkHDR:HdrFix: ratio direct nits=... sdrNits=... -> ratio=... current=...
+FkHDR:HdrFix: sync root unavailable, refusing unlocked ratio write
+FkHDR:HdrFix: specific chain ineffective after 2s -> fallback to GENERIC for this session
+FkHDR:HdrFix: HDR -> true/false
 ```
 
 | 现象 | 含义 |
 |---|---|
-| 没有 `init done` | 模块没被 LSPosed 加载，检查作用域是否勾了系统框架 |
-| `aosp ratio gate SKIPPED: no LocalDisplayDeviceExt field` | **正常**，纯 AOSP 没有 OPPO 的 Ext 字段 |
-| 有 `HDR -> true` 没有 `aosp push applied` | 主动推送失败，看同行的 `push skipped/failed` |
-| `ratio direct nits=.. current=NaN` | `useSurfaceControlBrightness=false`，只有物理提亮 |
-| 物理验证 | `adb shell su -c 'dmesg | grep dsi_display_set_backlight'`，HDR 时背光应跳到面板最大值（本机 2047） |
+| 没有 `init done` | 模块未被 LSPosed 加载；检查作用域和 `apkPath` |
+| `ratio bypass target missing` | 专项链比值接管没装上；GENERIC 仍在，属设计内降级 |
+| `chain -> GENERIC` | 专项链未通过运行时验证，或已主动降级 |
+| `spline install deferred` | 面板配置未就绪或字段形状不支持；watcher 会重试，GENERIC 继续工作 |
+| `sync root unavailable` | 拒绝无锁写 / 放行原方法，优先保证不崩溃 |
+| `SF layer dump failed` | HDR 证据不可用；清缓存后返回 null，不把旧 true 无限续命 |
+| `ratio direct ... current=NaN` | 当前比值不可用，不是成功上报；检查 nits 链与设备日志 |
+
+旧文档中的 `specific-chain probe -> true`、`SPECIFIC-ONLY(系统自算, 无补偿钩子)`、`aosp ratio gate opened` 不再出现；`Spline x=[2.0,650.0]` 在面板曲线可用时仍会打印。
 
 ---
 
@@ -119,8 +151,60 @@ FkHDR:HdrFix: aosp push applied brightness=0.39 sdr=0.39 state=2
 
 ```bash
 cd hdr-module
-./gradlew :app:assembleRelease --offline
+./gradlew :app:clean :app:assembleRelease --offline --console=plain
 # 产物：app/build/outputs/apk/release/app-release.apk
 ```
 
-要求：JDK 21、Android SDK 37、Gradle 9.8.0、AGP 9.4.1、Kotlin 2.4.20。
+要求：JDK 21、Android SDK 37、Gradle 9.8.0、AGP 9.4.1、Kotlin 2.4.20。`android.suppressUnsupportedCompileSdk=37` 与 `compileSdk = 37` 匹配。
+
+---
+
+## 实机验证（v1.7.2）
+
+设备：Redmi 22041216C / Android 15 / HyperOS / LSPosed 2.2.1（`lspctl status` 报 `apiVersion=102`）。验收 App：HDR能力检测 V0.7（`com.lns103.hdrCapability`）。
+
+```text
+lspctl --json module show io.github.benbaobaoshigemi.fkhdr
+  minApiVersion=102 targetApiVersion=102 legacy=false staticScope=true
+  declaredScope=["android","com.android.providers.settings"]
+FkHDR:FkModule: loaded api=102 framework=LSPosed/2.2.1 systemServer=true process=system
+FkHDR:HdrFix: init done [platform=aosp bypass=1 aosp[dev=1 bright=1] hbm=true probe=1 ratioAvail=1 forge=1 dpc=true media=3 wms=2] factor=100.0
+FkHDR:HdrFix: ratio availability candidates=2 withUpdateDeviceInfo=1 hooked=1
+FkHDR:HdrFix: ratio availability hook installed on 1 method(s)
+FkHDR:HdrFix: specific chain sdrHdrRatioSpline replaced (DisplayDeviceConfig.mSdrToHdrRatioSpline Spline x=[2.0,650.0] y=[5.0,1.0])
+FkHDR:HdrFix: ratio bypass nits=16.16 sdrNits=3.7 -> 4.37
+FkHDR:HdrFix: ratio bypass nits=18.43 sdrNits=3.7 -> 4.98
+FkHDR:HdrFix: setDisplayBrightness boost skipped (healthy specific chain)
+FkHDR:FkModule: hooking SettingsProvider
+FkHDR:SettingsProviderHook: initialized (module-only whitelist writes)
+```
+
+- 播放 HDR 时 `dumpsys display` 的 `DisplayDeviceInfo` / `mBaseDisplayInfo` / `mOverrideDisplayInfo` 三处 `hdrSdrRatio` 都是有限值（空闲 1.0，HDR 时随内容变化），不再出现 `not_available`。
+- 验收 App 从「HDR SDR调光支持 ❌ / 比率 1.00000」变为「✔ / 4.37384」，与 bypass 日志的 4.37 一致 → 应用已注册监听并实时收到比值。
+- `setDisplayBrightness boost skipped (healthy specific chain)` 说明专项链（系统自算比值）在跑，GENERIC 亮度补偿主动让位；HDR 退出后仍按 1200ms 迟滞回落。
+
+### 第二台设备：一加平板 Pro（OPD2404，Android 16 / ColorOS，LSPosed 2.2.1 API 102）
+
+`platform=coloros`：走 OEM 原生驱动 + GENERIC 兜底。Android 16 上 `sdrToHdrSpline=false`（这一版没有 `DisplayDeviceConfig.mSdrToHdrRatioSpline`），专项链按设计不安装。
+
+```text
+FkHDR:FkModule: loaded api=102 framework=LSPosed/2.2.1 systemServer=true process=system
+FkHDR:HdrFix: init done [platform=coloros features=2 ratioMax=true featCfg=4 fmgr=1 ratioFlag=1 native=true boost=1 forge=1 dpc=true media=3 wms=1] factor=100.0
+FkHDR:HdrFix: panel config ready [sdrToHdrSpline=false]
+FkHDR:HdrFix: chain = GENERIC(模块代劳, 兜底已安装)
+FkHDR:HdrFix: driver ready [support=true maxNit=846.09 factor=0.0]
+FkHDR:FkModule: hooking SettingsProvider
+FkHDR:SettingsProviderHook: initialized (module-only whitelist writes)
+FkHDR:HdrFix: HDR -> true(focus=true) [need=true enter=true enhanced=false playingHDR=0 battery=57 powerSave=false maxNit=846.09]
+FkHDR:HdrFix: pp nit=99.39909/99.39909 cap=none(physical) [...]
+FkHDR:HdrFix: fallback idle (native engaged, nit=846.09 sdrNit=99.4 ratio=8.51)
+FkHDR:HdrFix: mgr pp ran nit=846.09485 sdrNit=99.39909 brightness=2047.0
+```
+
+验收 App：HDR SDR调光支持 ✔、HDR SDR调光比率 8.51210、逻辑峰值亮度 1728 cd/m²、HDR显示状态 ✔。
+
+## 验证与 GAP
+
+- 已完成：7 份切片审查 + AOSP15 基线对照；`git diff --check`、`:app:compileReleaseKotlin`、clean release 构建、`aapt2 dump badging` 通过；两台设备实机验收通过（Android 15 手机专项链 ✔ 4.37 / Android 16 平板原生驱动 + GENERIC ✔ 8.51，截图均已存证）。
+- 未完成：其它 ROM；Android 16 上 `sdrToHdrRatioSpline` 缺失，专项链在 Android 16 未验证；多显示器实例隔离；HDR 关闭后的回落读数存证；仪器化测试。
+- 不要把 v1.6.1 的历史实测数值当作本版本验收证据。完整契约见 [docs/aosp-alignment.md](../docs/aosp-alignment.md)。

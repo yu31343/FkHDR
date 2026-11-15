@@ -1,5 +1,7 @@
 # ColorOS 16 (OPD2404 / OnePlus Pad Pro) HDR 亮度链路逆向报告
 
+> ⚠️ 历史记录（截至 v1.6.1）：本文的字段名、版本号、日志样例与实现结论只描述当时的样本；当前 FkHDR v1.6.2 的行为以 [AOSP 对齐记录](aosp-alignment.md) 与 [hdr-module/README.md](../hdr-module/README.md) 为准。
+
 > 分析对象: `oplus-framework.jar` (10.6 MB) / `oplus-services.jar` (24.7 MB, 从设备 `/system/framework/` 拉取)
 > 对照: `services.jar` (AOSP 16) / `framework.jar`
 > 设备: OnePlus Pad Pro OPD2404, ColorOS 16.0.1.301(CN01), Android 16

@@ -2,7 +2,6 @@ package io.github.fkhdr
 
 import android.content.Context
 import android.content.SharedPreferences
-import de.robv.android.xposed.XSharedPreferences
 import java.io.File
 
 /**
@@ -13,7 +12,7 @@ import java.io.File
  *     LSPosed 注入的进程读不到本模块私有 prefs（SELinux 拦截），所以开关一律以它为准。
  *  2) 本地 SharedPreferences —— 仅模块自身 UI 进程可读，作为 UI 回显与 Settings.System
  *     写入失败（无 WRITE_SETTINGS 授权）时的兜底。
- *  3) XSharedPreferences —— 仅模块自身进程使用；被 hook 的进程里不碰，避免 avc denied 刷屏。
+ *  3) 模块自身 prefs —— 仅模块自身进程使用；被 hook 的进程里不碰，避免 avc denied 刷屏。
  */
 object Config {
     const val PACKAGE_NAME = "io.github.benbaobaoshigemi.fkhdr"
@@ -28,16 +27,6 @@ object Config {
     const val MIN_RATIO_MAX = 1.0f
     const val MAX_RATIO_MAX = 20.0f
 
-    /** 门禁守护：是否周期性（3s）重申 mSupportUltraHDR / mForceSurfaceControl。
-     *  默认关闭 —— 正常情况开机时置位一次即可；只有 ROM 会中途重置时才需要打开。 */
-    const val KEY_GATE_WATCHDOG = "hdr_gate_watchdog"
-
-    fun getGateWatchdog(): Boolean = try {
-        getBooleanConfig(KEY_GATE_WATCHDOG, false)
-    } catch (_: Throwable) {
-        false
-    }
-
     /** 读封顶上限；读不到用默认 5.0 */
     fun getRatioMax(): Float {
         val fromSettings = try {
@@ -47,7 +36,7 @@ object Config {
         } catch (_: Throwable) {
             null
         }
-        // 与 getBooleanConfig 一致：system_server 里绝不碰 XSharedPreferences（会 avc denied 刷屏，
+        // 与 getBooleanConfig 一致：system_server 里绝不碰模块私有 prefs（会 avc denied 刷屏，
         // 而且这里处在亮度 ramp 的关键路径上，文件 IO 会直接掉帧）。
         val v = fromSettings ?: if (inModuleProcess()) {
             try {
@@ -86,30 +75,26 @@ object Config {
         return ok
     }
 
-    private var xPrefs: XSharedPreferences? = null
+    private var xPrefs: ModulePrefs? = null
 
-    fun getXPrefs(): XSharedPreferences {
+    /**
+     * 模块自身进程内的 prefs 门面。
+     *
+     * api 102 的模块不能再引用 legacy 的 XSharedPreferences（de.robv.* 在 102 下不可用）。
+     * 这里只有模块自己的进程会读它——被 hook 的进程读模块私有 prefs 会被 SELinux 拒绝，
+     * 所以直接用本进程的 SharedPreferences，不再需要 makeWorldReadable()。
+     */
+    fun getXPrefs(): ModulePrefs {
         val cached = xPrefs
-        if (cached == null) {
-            val deFile = File("/data/user_de/0/$PACKAGE_NAME/shared_prefs/$PREFS_NAME.xml")
-            val ceFile = File("/data/data/$PACKAGE_NAME/shared_prefs/$PREFS_NAME.xml")
-            val created = when {
-                deFile.exists() -> XSharedPreferences(deFile)
-                ceFile.exists() -> XSharedPreferences(ceFile)
-                else -> XSharedPreferences(PACKAGE_NAME, PREFS_NAME)
-            }
-            try {
-                created.makeWorldReadable()
-            } catch (_: Throwable) {
-            }
-            xPrefs = created
-            return created
-        }
-        try {
-            cached.reload()
+        if (cached != null) return cached
+        val sp = try {
+            appContext()?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         } catch (_: Throwable) {
+            null
         }
-        return cached
+        val created = ModulePrefs(sp)
+        xPrefs = created
+        return created
     }
 
     /**
@@ -117,7 +102,7 @@ object Config {
      *
      * 模块自身进程用 currentApplication()；被 hook 的 system_server 里 currentApplication()
      * 常常是 null（没有 Application 实例），会导致 Settings.System 读不到 ->
-     * 一路回退到 XSharedPreferences -> SELinux 拦截（avc denied）-> 开关失效 + 日志刷屏。
+     * 一路回退到模块私有 prefs -> SELinux 拦截（avc denied）-> 开关失效 + 日志刷屏。
      * 这里用 currentActivityThread() + getSystemContext() 兜底，拿到的就是 system_server 的 Context。
      */
     private fun appContext(): Context? = try {
@@ -148,6 +133,14 @@ object Config {
         } catch (_: Throwable) {
             -1
         }
+    }
+
+    /** 读 Settings.System 的浮点值；读不到返回 def，用于 UI 写入后回读校验。 */
+    fun getSettingFloat(key: String, def: Float): Float = try {
+        val cr = appContext()?.contentResolver ?: return def
+        android.provider.Settings.System.getFloat(cr, key, def)
+    } catch (_: Throwable) {
+        def
     }
 
     /** HDR 提亮修复开关，默认开启 */
@@ -225,5 +218,32 @@ object Config {
             }.start()
         } catch (_: Throwable) {
         }
+    }
+}
+
+/** 只读 prefs 门面：拿不到 Context 时全部返回默认值，不抛异常。 */
+class ModulePrefs(private val sp: SharedPreferences?) {
+    fun getBoolean(key: String, def: Boolean): Boolean = try {
+        sp?.getBoolean(key, def) ?: def
+    } catch (_: Throwable) {
+        def
+    }
+
+    fun getFloat(key: String, def: Float): Float = try {
+        sp?.getFloat(key, def) ?: def
+    } catch (_: Throwable) {
+        def
+    }
+
+    fun getInt(key: String, def: Int): Int = try {
+        sp?.getInt(key, def) ?: def
+    } catch (_: Throwable) {
+        def
+    }
+
+    fun getString(key: String, def: String?): String? = try {
+        sp?.getString(key, def)
+    } catch (_: Throwable) {
+        def
     }
 }

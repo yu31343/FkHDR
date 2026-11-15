@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">FkHDR</string>
+    <string name="module_description">HDR 提亮修复：HDR 内容出现时按 AOSP 曲线抬高亮度，并上报真实的 HDR/SDR 比值（libxposed API 102）</string>
 </resources>

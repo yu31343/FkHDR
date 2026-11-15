@@ -15,8 +15,8 @@ android {
         applicationId = "io.github.benbaobaoshigemi.fkhdr"
         minSdk = 26
         targetSdk = 34
-        versionCode = 25
-        versionName = "1.6.1"
+        versionCode = 29
+        versionName = "1.7.2"
     }
 
     signingConfigs {
@@ -62,6 +62,7 @@ kotlin {
 }
 
 dependencies {
-    // 唯一依赖：LSPosed / Xposed API（compileOnly，运行时由框架提供）
-    compileOnly("de.robv.android.xposed:api:82")
+    // 唯一依赖：libxposed API 102（compileOnly，运行时由 LSPosed 框架注入）
+    // 旧版 de.robv.android.xposed:api:82 已移除：targetApiVersion=102 的模块不允许再引用 legacy API。
+    compileOnly("io.github.libxposed:api:102.0.0")
 }

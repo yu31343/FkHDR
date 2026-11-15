@@ -1,8 +1,9 @@
 package io.github.fkhdr.hooks
 
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
+import io.github.fkhdr.xp.Xp
+import io.github.fkhdr.xp.XpHook
+import io.github.fkhdr.xp.XpHook.MethodHookParam
+import io.github.fkhdr.xp.XpHelpers
 
 /**
  * FkHDR · HDR 提亮修复（独立模块，从 FkOScreen 拆分）
@@ -40,15 +41,17 @@ import de.robv.android.xposed.XposedHelpers
  *    若 hdrOn 且系统没有把 nit 抬上去（nit/sdrNit <= 1.02），直接按面板上限改 nit，
  *    并先 setHasEdrProcessed() 保住 SDR 白点，让系统自己算出真实比率。
  *    ——这一层不依赖任何 OPPO feature 类，改类名/改开关也照样生效。
- * C. 比率开关：LocalDisplayDeviceExtImpl#isSupportSdrToHdrRatio() 恒 true，
- *    让系统愿意上报 hdrSdrRatio。
+ * C. 比率开关（仅 ColorOS 分支）：LocalDisplayDeviceExtImpl#isSupportSdrToHdrRatio() 恒 true，
+ *    让系统愿意上报 hdrSdrRatio；AOSP 分支不碰这个闸门。
  *
  * ── 关于「HDR 亮度比例」────────────────────────────────────
- * 不使用任何写死的比率。ratio = 面板 nit / SDR 白点 nit，由面板硬件上限决定：
- * 亮度越低比值越大，亮度拉满时自然回落到 1.0；HDR 关闭后回落 1.0。
+ * 有效输入按 AOSP 公式计算 ratio = max(1, 面板 nit / SDR 白点 nit)，且不人为封顶；
+ * 厂商亮度通路由系统决定，模块绝不写 mSupportUltraHDR / mForceSurfaceControl。
+ * 无效输入保留 Float.NaN —— AOSP 用 NaN 表示「比值不可用」，不得伪装成 1.0；
+ * 退出 HDR 时只清理残留的有限旧比值，不主动写入 1.0。
  *
  * ── 诊断 ────────────────────────────────────────────────────
- * 所有关键节点写 XposedBridge.log（LSPosed 管理器 → 日志 可见），前缀 FkHDR:HdrFix。
+ * 所有关键节点写 Xp.log（LSPosed 管理器 → 日志 可见），前缀 FkHDR:HdrFix。
  * 不生效时日志能直接区分：「类没找到 / hook 没挂上 / feature 没开 /
  * 系统没调 postProcessing / 提亮被上限截断 / 亮度没推上去 / 比值没算出来」。
  */
@@ -110,6 +113,8 @@ object HdrBoostHook {
     )
 
     @Volatile private var hdrEnhance: Any? = null
+    /** 开关关闭期间构造的原生驱动：只记录实例，开关打开后由驱动回调补跑 hardening。 */
+    @Volatile private var driverHardenPending: Any? = null
     @Volatile private var wms: Any? = null
     @Volatile private var hdrOn = false
     @Volatile private var nativeDriver = false
@@ -136,7 +141,7 @@ object HdrBoostHook {
         logAt[key] = now
         try {
             val s = msg()
-            if (s.isNotEmpty()) XposedBridge.log(s)
+            if (s.isNotEmpty()) Xp.log(s)
         } catch (_: Throwable) {
         }
     }
@@ -166,7 +171,7 @@ object HdrBoostHook {
     }
 
     private fun exists(cl: ClassLoader, name: String): Boolean = try {
-        XposedHelpers.findClass(name, cl)
+        XpHelpers.findClass(name, cl)
         true
     } catch (_: Throwable) {
         false
@@ -194,7 +199,7 @@ object HdrBoostHook {
             // ColorOS 上 OPPO 通路全部失配时（未来版本改类名等），退回 AOSP 通路兜底
             if (!nativeDriver && boostN == 0) {
                 oppoPathDead = true
-                XposedBridge.log("$TAG: OPPO path all missing on coloros -> enable AOSP fallback")
+                Xp.log("$TAG: OPPO path all missing on coloros -> enable AOSP fallback")
             }
         }
 
@@ -203,19 +208,20 @@ object HdrBoostHook {
         val forceAosp = prop2(PROP_AOSP_FORCE, PROP_AOSP_FORCE_OLD, "0") == "1"
         aospMode = platform == PLAT_AOSP || forceAosp || oppoPathDead
         if (aospMode) {
-            specificOnlyChain = specificChainPossible(classLoader)
-            // ★ 不再写 mSupportUltraHDR / mForceSurfaceControl：
-            //   后者会把亮度输出切到 SurfaceControl 通路，本机不支持 -> 屏幕点不亮（已实测）。
-            //   改为直接接管 handleHdrSdrNitsChanged，等价于旧模块删掉门禁代码。
+            // GENERIC 兜底永远安装：启动期静态探测不能决定运行时是否真能走专项链路。
+            // 专项链路只由 refreshSpecificMode() 依据 splineInstalled + ratioBypassInstalled
+            // + ratioBypassVerified 动态判定；watcher 始终运行以便失效时自愈/降级。
+            // 绝不写 mSupportUltraHDR / mForceSurfaceControl（会把亮度切到不支持的通路）。
             steps.append(" bypass=").append(hookAospRatioBypass(classLoader))
-            if (!specificOnlyChain) {
-                // 补偿链路：只有开不出门禁的 ROM 才需要
-                steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
-                steps.append(" hbm=").append(hookHighBrightnessModeController(classLoader))
-            }
-            // 只读诊断，两种链路都挂（不改行为）
+            steps.append(" aosp[").append(hookAospLocalDisplay(classLoader)).append("]")
+            steps.append(" hbm=").append(hookHighBrightnessModeController(classLoader))
             steps.append(" probe=").append(hookRatioProbeOnly(classLoader))
-            steps.append(" chain=").append(if (specificOnlyChain) "SPECIFIC-ONLY" else "GENERIC")
+            // 应用侧「HDR SDR 调光支持」= !Float.isNaN(DisplayInfo.hdrSdrRatio)。
+            // 空闲期系统把比值写成 NaN，于是应用永远看到「不支持」，也永远不会
+            // registerHdrSdrRatioChangedListener —— 功能在应用眼里就是坏的。
+            // 在 DisplayDeviceInfo 重建前按 AOSP 自己的下界语义（比值恒 >= 1）把 NaN 归一成 1.0：
+            // 1.0 = 当前 HDR 与 SDR 同亮度；HDR 一开就被真实比值覆盖。
+            steps.append(" ratioAvail=").append(hookRatioAvailability(classLoader))
         }
         // 注意：hookAospRatioGate(DisplayDeviceConfig.hasSdrToHdrRatioSpline) 已删除。
         // 实机证明它被 ART 内联、完全不生效，且会在 HDR 期间每帧放行 updateDeviceInfoLocked。
@@ -224,16 +230,13 @@ object HdrBoostHook {
         // DisplayInfo 伪装也放通用段：patchDisplayInfo 自带守卫（已含 11/12 就原样返回），
         // 真 HDR 机型不会被改动；缺 HDR 色彩模式的机型（本机）才会被补上。
         steps.append(" forge=").append(hookDisplayInfoForgery(classLoader))
-        steps.append(" nan=").append(hookRatioNeverNaN(classLoader))
+        // 系统内部仍以 NaN 表示「比值不可用」，只在信息重建前做应用可见的可用性归一（hookRatioAvailability）。
         steps.append(" dpc=").append(hookDisplayPowerController(classLoader))
-        // 专项链路下，HDR 检测完全由系统自己的 SurfaceControlHdrLayerInfoListener 完成，
-        // 模块不需要媒体会话/焦点窗口/状态机 —— 这些全部不挂。
-        if (!specificOnlyChain) {
-            steps.append(" media=").append(hookMediaSessions(classLoader))
-            steps.append(" wms=").append(hookWindowManager(classLoader))
-            startWatcher()
-        }
-        XposedBridge.log("$TAG: init done [" + steps + "] factor=" + factor())
+        // watcher 无条件运行：GENERIC 状态机、专项链路自愈与降级都在里面。
+        steps.append(" media=").append(hookMediaSessions(classLoader))
+        steps.append(" wms=").append(hookWindowManager(classLoader))
+        startWatcher()
+        Xp.log("$TAG: init done [" + steps + "] factor=" + factor())
     }
 
     // ── 属性 ────────────────────────────────────────────────
@@ -256,7 +259,7 @@ object HdrBoostHook {
 
     // enabled() 在 watcher 里每 400ms 调一次，加 5s 缓存避免反复 read syscall
     @Volatile private var enabledCache = true
-    @Volatile private var enabledAt = 0L
+    @Volatile private var enabledAt = -5000L
 
     /** 开关优先级：系统属性 > 模块界面开关（复用原 hdr_ratio_fix 键） */
     private fun enabled(): Boolean {
@@ -305,17 +308,17 @@ object HdrBoostHook {
         val cfg = displayConfig ?: return Float.MAX_VALUE
         if (!hasRatioSpline || sdrNit <= 0f || sdrNit.isNaN()) return Float.MAX_VALUE
         return try {
-            val model = XposedHelpers.getObjectField(mgr, "mBrightnessModel")
+            val model = XpHelpers.getObjectField(mgr, "mBrightnessModel")
             // nit -> brightness
-            val sdrB = XposedHelpers.callMethod(model, "getValueByCurve", "backlights", sdrNit) as? Float
+            val sdrB = XpHelpers.callMethod(model, "getValueByCurve", "nits", sdrNit) as? Float
             if (sdrB == null || sdrB <= 0f) return Float.MAX_VALUE
             // 面板曲线给出的 HDR brightness
-            val hdrB = XposedHelpers.callMethod(
+            val hdrB = XpHelpers.callMethod(
                 cfg, "getHdrBrightnessFromSdr", sdrB, Float.MAX_VALUE
             ) as? Float
             if (hdrB == null || hdrB <= 0f) return Float.MAX_VALUE
             // brightness -> nit，换算回 hdrSdrRatio 的同一量纲
-            val hdrNit = XposedHelpers.callMethod(model, "getValueByCurve", "nits", hdrB) as? Float
+            val hdrNit = XpHelpers.callMethod(model, "getValueByCurve", "backlights", hdrB) as? Float
                 ?: return Float.MAX_VALUE
             val r = hdrNit / sdrNit
             if (r > 1f) r else Float.MAX_VALUE
@@ -333,27 +336,27 @@ object HdrBoostHook {
 
     // ── 工具：安全 hook + 安全读写字段 ───────────────────────
     /** 返回该名字实际挂上多少个方法（0 = 这个版本里没有该方法） */
-    private fun hookAll(cls: Class<*>, name: String, hook: XC_MethodHook): Int = try {
-        XposedBridge.hookAllMethods(cls, name, hook).size
+    private fun hookAll(cls: Class<*>, name: String, hook: XpHook): Int = try {
+        Xp.hookAllMethods(cls, name, hook).size
     } catch (t: Throwable) {
         logEvery("hook_" + name, 60000L) { "$TAG: hook " + name + " unavailable: " + t }
         0
     }
 
     private fun boolField(o: Any, n: String): String = try {
-        XposedHelpers.getBooleanField(o, n).toString()
+        XpHelpers.getBooleanField(o, n).toString()
     } catch (_: Throwable) {
         "?"
     }
 
     private fun intField(o: Any, n: String): String = try {
-        XposedHelpers.getIntField(o, n).toString()
+        XpHelpers.getIntField(o, n).toString()
     } catch (_: Throwable) {
         "?"
     }
 
     private fun floatField(o: Any, n: String): String = try {
-        f2(XposedHelpers.getFloatField(o, n))
+        f2(XpHelpers.getFloatField(o, n))
     } catch (_: Throwable) {
         "?"
     }
@@ -364,10 +367,10 @@ object HdrBoostHook {
 
     // ── A1. 补 feature 配置 ─────────────────────────────────
     private fun hookFeatures(classLoader: ClassLoader): Int = try {
-        val svc = XposedHelpers.findClass(
+        val svc = XpHelpers.findClass(
             "com.android.server.content.OplusFeatureConfigManagerService", classLoader
         )
-        val hook = object : XC_MethodHook() {
+        val hook = object : XpHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 if (!enabled()) return
                 val name = param.args.getOrNull(0) as? String ?: return
@@ -376,20 +379,20 @@ object HdrBoostHook {
         }
         hookAll(svc, "hasFeature", hook) + hookAll(svc, "hasFeatureMap", hook)
     } catch (t: Throwable) {
-        XposedBridge.log("$TAG: feature service not found: " + t.message)
+        Xp.log("$TAG: feature service not found: " + t.message)
         0
     }
 
     // ── A2. 比率开关：让系统愿意算/上报 hdrSdrRatio ──────────
     private fun hookRatioSupport(classLoader: ClassLoader): Int = try {
-        val ext = XposedHelpers.findClass(CLS_LOCAL_DEVICE_EXT, classLoader)
-        hookAll(ext, "isSupportSdrToHdrRatio", object : XC_MethodHook() {
+        val ext = XpHelpers.findClass(CLS_LOCAL_DEVICE_EXT, classLoader)
+        hookAll(ext, "isSupportSdrToHdrRatio", object : XpHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 if (enabled()) param.result = true
             }
         })
     } catch (t: Throwable) {
-        XposedBridge.log("$TAG: LocalDisplayDeviceExtImpl not found: " + t.message)
+        Xp.log("$TAG: LocalDisplayDeviceExtImpl not found: " + t.message)
         0
     }
 
@@ -397,25 +400,25 @@ object HdrBoostHook {
     // DisplayManagerServiceExtImpl#getHighestHdrSdrRatio() 是 OPPO 对"这个面板最多能到几倍"的官方答案。
     // 用它当上限，比我们硬编码任何数字都更贴近"物理硬件可接受"。
     private fun hookSystemRatioMax(classLoader: ClassLoader): Boolean = try {
-        val cls = XposedHelpers.findClass(
+        val cls = XpHelpers.findClass(
             "com.android.server.display.DisplayManagerServiceExtImpl", classLoader
         )
-        val n = hookAll(cls, "getHighestHdrSdrRatio", object : XC_MethodHook() {
+        val n = hookAll(cls, "getHighestHdrSdrRatio", object : XpHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val v = (param.result as? Float) ?: return
                 if (v > 1f && v != sysRatioMax) {
                     sysRatioMax = v
-                    XposedBridge.log("$TAG: system declared max hdr/sdr ratio = " + f2(v))
+                    Xp.log("$TAG: system declared max hdr/sdr ratio = " + f2(v))
                 }
             }
         })
         // 顺带主动问一次，避免等别人调用
         try {
-            val inst = XposedHelpers.callStaticMethod(
+            val inst = XpHelpers.callStaticMethod(
                 cls, "getInstance"
             )
             if (inst != null) {
-                val v = XposedHelpers.callMethod(inst, "getHighestHdrSdrRatio") as? Float
+                val v = XpHelpers.callMethod(inst, "getHighestHdrSdrRatio") as? Float
                 if (v != null && v > 1f) sysRatioMax = v
             }
         } catch (_: Throwable) {
@@ -439,23 +442,23 @@ object HdrBoostHook {
     // 只改 binder 返回值，不动 DisplayManagerService 内部状态，也不动 HWC。
     // 实测：HDR colorMode 窗口在本机被 SF 静默降级为 SDR，不会花屏。
     private fun hookDisplayInfoForgery(classLoader: ClassLoader): Int = try {
-        val binder = XposedHelpers.findClass(
+        val binder = XpHelpers.findClass(
             CLS_DMS + '$' + "BinderService", classLoader
         )
-        hookAll(binder, "getDisplayInfo", object : XC_MethodHook() {
+        hookAll(binder, "getDisplayInfo", object : XpHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 if (!enabled()) return
                 patchDisplayInfo(param.result ?: return)
             }
         })
     } catch (t: Throwable) {
-        XposedBridge.log("$TAG: BinderService not found: " + t.message)
+        Xp.log("$TAG: BinderService not found: " + t.message)
         0
     }
 
     private fun patchDisplayInfo(info: Any) {
         try {
-            val cur = XposedHelpers.getObjectField(info, "supportedColorModes") as? IntArray
+            val cur = XpHelpers.getObjectField(info, "supportedColorModes") as? IntArray
             if (cur != null && cur.contains(11) && cur.contains(12)) return
             val src = cur ?: IntArray(0)
             val set = java.util.TreeSet<Int>()
@@ -468,7 +471,7 @@ object HdrBoostHook {
             for (v in set) {
                 out[i++] = v
             }
-            XposedHelpers.setObjectField(info, "supportedColorModes", out)
+            XpHelpers.setObjectField(info, "supportedColorModes", out)
             logEvery("forge", 60000L) {
                 "$TAG: forged DisplayInfo HDR colorModes " +
                     src.joinToString(",") + " -> " + out.joinToString(",")
@@ -492,7 +495,7 @@ object HdrBoostHook {
     // 两条都兜住才算通杀。
     private fun hookFeatureSingleton(classLoader: ClassLoader): Int {
         var n = 0
-        val hook = object : XC_MethodHook() {
+        val hook = object : XpHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 if (!enabled()) return
                 val name = param.args.getOrNull(0) as? String ?: return
@@ -500,13 +503,13 @@ object HdrBoostHook {
             }
         }
         try {
-            val cls = XposedHelpers.findClass(CLS_FEATURE_MGR, classLoader)
+            val cls = XpHelpers.findClass(CLS_FEATURE_MGR, classLoader)
             n += hookAll(cls, "hasFeature", hook)
         } catch (t: Throwable) {
             logEvery("featmgr", 60000L) { "$TAG: feature singleton unavailable: " + t.message }
         }
         try {
-            val cls = XposedHelpers.findClass(CLS_FEATURE_CACHE, classLoader)
+            val cls = XpHelpers.findClass(CLS_FEATURE_CACHE, classLoader)
             n += hookAll(cls, "query", hook)
         } catch (t: Throwable) {
             logEvery("featcache", 60000L) { "$TAG: feature cache unavailable: " + t.message }
@@ -521,15 +524,15 @@ object HdrBoostHook {
     //     if (this.mEnhanceHDRBrightnessSupport) { this.mHDREnhanceBrightness = new ... }
     // 一定会执行。
     private fun hookFeatureManager(classLoader: ClassLoader): Int = try {
-        val cls = XposedHelpers.findClass(CLS_FEATURE_MANAGER, classLoader)
-        val hook = object : XC_MethodHook() {
+        val cls = XpHelpers.findClass(CLS_FEATURE_MANAGER, classLoader)
+        val hook = object : XpHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 if (!enabled()) return
                 val self = param.thisObject
                 try {
-                    if (!XposedHelpers.getBooleanField(self, "mEnhanceHDRBrightnessSupport")) {
-                        XposedHelpers.setBooleanField(self, "mEnhanceHDRBrightnessSupport", true)
-                        XposedBridge.log("$TAG: forced mEnhanceHDRBrightnessSupport=true")
+                    if (!XpHelpers.getBooleanField(self, "mEnhanceHDRBrightnessSupport")) {
+                        XpHelpers.setBooleanField(self, "mEnhanceHDRBrightnessSupport", true)
+                        Xp.log("$TAG: forced mEnhanceHDRBrightnessSupport=true")
                     }
                 } catch (t: Throwable) {
                     logEvery("fmgrfail", 5000L) {
@@ -544,40 +547,48 @@ object HdrBoostHook {
         n += hookAll(cls, "constructOptionalEnhanceFeatures", hook)
         n
     } catch (t: Throwable) {
-        XposedBridge.log("$TAG: OplusDisplayFeatureManager not found: " + t.message)
+        Xp.log("$TAG: OplusDisplayFeatureManager not found: " + t.message)
         0
     }
 
     // ── B. 首选：驱动 ColorOS 自己的 HDR 提亮实现 ────────────
     private fun hookOplusHdrEnhance(classLoader: ClassLoader): Boolean {
         return try {
-            val cls = XposedHelpers.findClass(CLS_HDR_ENHANCE, classLoader)
-            XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
+            val cls = XpHelpers.findClass(CLS_HDR_ENHANCE, classLoader)
+            Xp.hookAllConstructors(cls, object : XpHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val self = param.thisObject
+                    // 实例始终记录，watcher 在开关打开后仍要用它判断 HDR 状态；
+                    // 但开关关闭时不写任何厂商字段，hardening 推迟到开关打开后的驱动回调。
                     hdrEnhance = self
-                    XposedBridge.log("$TAG: driver ready [" + hardenDriver(self) + "]")
+                    if (enabled()) {
+                        Xp.log("$TAG: driver ready [" + hardenDriver(self) + "]")
+                    } else {
+                        driverHardenPending = self
+                        Xp.log("$TAG: driver captured while disabled; hardening deferred")
+                    }
                 }
             })
 
             // 保住 SDR 白点：ColorOS 的 setNit() 在 mHasEdrProcessed==false 时会把
             // sdrNit 一起改掉，先置 hasEdrProcessed 系统才能算出真实比率。
-            val nPost = hookAll(cls, "postProcessing", object : XC_MethodHook() {
+            val nPost = hookAll(cls, "postProcessing", object : XpHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (!enabled()) return
+                    hardenDriverIfPending(param.thisObject)
                     val builder = param.args.getOrNull(0) ?: return
                     if (!hdrOn) return
                     try {
-                        XposedHelpers.callMethod(builder, "setHasEdrProcessed")
+                        XpHelpers.callMethod(builder, "setHasEdrProcessed")
                     } catch (_: Throwable) {
                     }
                     // C17 新增了按包名取 mEnhanceFactor 的白名单逻辑，
                     // 每次后处理前都重新压一遍，保证不受任何应用切换影响。
                     val self = param.thisObject
                     try {
-                        XposedHelpers.setBooleanField(self, "mEnterWhiteApp", true)
-                        XposedHelpers.setFloatField(self, "mEnhanceFactor", nativeFactor())
-                        XposedHelpers.setBooleanField(self, "mNeedToEnhanceBrightness", true)
+                        XpHelpers.setBooleanField(self, "mEnterWhiteApp", true)
+                        XpHelpers.setFloatField(self, "mEnhanceFactor", nativeFactor())
+                        XpHelpers.setBooleanField(self, "mNeedToEnhanceBrightness", true)
                     } catch (_: Throwable) {
                     }
                     logEvery("pp", 2000L) {
@@ -593,7 +604,7 @@ object HdrBoostHook {
             // C17 的 onAppEnter(pkg) 会 getEnhanceFactorForPackage(pkg)：
             //   不在 display_brightness_app_list.xml 里 -> 返回 null -> 直接 return，不设 mEnterWhiteApp
             // 这里让它对所有包都返回我们的倍率，白名单形同不存在。
-            val nFactor = hookAll(cls, "getEnhanceFactorForPackage", object : XC_MethodHook() {
+            val nFactor = hookAll(cls, "getEnhanceFactorForPackage", object : XpHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (enabled()) param.result = factor()
                 }
@@ -601,7 +612,7 @@ object HdrBoostHook {
 
             // onAppExit 会无条件 mEnterWhiteApp=false + exitEnhanceBrightness()，
             // HDR 期间任何一次应用切换都会把提亮掐掉 —— 直接短路掉。
-            val nExit = hookAll(cls, "onAppExit", object : XC_MethodHook() {
+            val nExit = hookAll(cls, "onAppExit", object : XpHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (enabled() && hdrOn) {
                         param.result = null
@@ -613,13 +624,14 @@ object HdrBoostHook {
             })
 
             // 接管 HDR 状态：不走白名单，直接设 mEnterWhiteApp，再走它自己的 enter/exit。
-            val nCheck = hookAll(cls, "checkIsPlayingHDR", object : XC_MethodHook() {
+            val nCheck = hookAll(cls, "checkIsPlayingHDR", object : XpHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     if (!enabled()) return
                     val self = param.thisObject
+                    hardenDriverIfPending(self)
                     try {
-                        XposedHelpers.setBooleanField(self, "mEnterWhiteApp", hdrOn)
-                        XposedHelpers.setFloatField(self, "mEnhanceFactor", nativeFactor())
+                        XpHelpers.setBooleanField(self, "mEnterWhiteApp", hdrOn)
+                        XpHelpers.setFloatField(self, "mEnhanceFactor", nativeFactor())
                         if (hdrOn) callPriv(self, "enterEnhanceBrightness")
                         else callPriv(self, "exitEnhanceBrightness")
                     } catch (t: Throwable) {
@@ -630,7 +642,7 @@ object HdrBoostHook {
                 }
             })
 
-            XposedBridge.log(
+            Xp.log(
                 "$TAG: native driver hooked (post=" + nPost + " check=" + nCheck +
                     " enter=" + hasMethod(cls, "enterEnhanceBrightness") +
                     " exit=" + hasMethod(cls, "exitEnhanceBrightness") +
@@ -638,7 +650,7 @@ object HdrBoostHook {
             )
             nPost > 0 || nCheck > 0
         } catch (t: Throwable) {
-            XposedBridge.log("$TAG: native driver unavailable: " + t.message)
+            Xp.log("$TAG: native driver unavailable: " + t.message)
             false
         }
     }
@@ -646,22 +658,24 @@ object HdrBoostHook {
     /**
      * 兜住 ColorOS 自己的开关：新版系统上 OplusFeatureConfigManager 的查询链可能变了，
      * mEnhanceHDRBrightnessSupport 会恒 false —— postProcessing 就整个静默失效。
-     * 这里直接掰成 true 并补跑 init()。
+     * 仅在开关打开且该字段为 false 时掰成 true 并补跑 init()。
      */
-    private fun hardenDriver(self: Any): String {
+    private fun hardenDriver(selfOrNull: Any?): String {
+        val self = selfOrNull ?: return "no-driver"
+        if (!enabled()) return "disabled(no write)"
         val sb = StringBuilder()
         val support = try {
-            XposedHelpers.getBooleanField(self, "mEnhanceHDRBrightnessSupport")
+            XpHelpers.getBooleanField(self, "mEnhanceHDRBrightnessSupport")
         } catch (_: Throwable) {
             true
         }
         sb.append("support=").append(support)
         if (!support) {
             try {
-                XposedHelpers.setBooleanField(self, "mEnhanceHDRBrightnessSupport", true)
+                XpHelpers.setBooleanField(self, "mEnhanceHDRBrightnessSupport", true)
                 sb.append("->true")
                 try {
-                    XposedHelpers.callMethod(self, "init")
+                    XpHelpers.callMethod(self, "init")
                     sb.append("(init ok)")
                 } catch (t: Throwable) {
                     sb.append("(init fail:").append(t.javaClass.simpleName).append(")")
@@ -675,9 +689,19 @@ object HdrBoostHook {
         return sb.toString()
     }
 
-    private fun callPriv(self: Any, name: String) {
+    /** 开关由关变开后，在真正运行的驱动回调里补一次 hardened 检查（不再无条件写字段）。 */
+    private fun hardenDriverIfPending(selfOrNull: Any?) {
+        val self = selfOrNull ?: return
+        val pending = driverHardenPending ?: return
+        if (!enabled() || pending !== self) return
+        driverHardenPending = null
+        Xp.log("$TAG: driver ready (deferred) [" + hardenDriver(pending) + "]")
+    }
+
+    private fun callPriv(selfOrNull: Any?, name: String) {
+        val self = selfOrNull ?: return
         try {
-            XposedHelpers.callMethod(self, name)
+            XpHelpers.callMethod(self, name)
         } catch (t: Throwable) {
             logEvery("call_" + name, 3000L) { "$TAG: " + name + " failed: " + t }
         }
@@ -705,16 +729,17 @@ object HdrBoostHook {
     // 所以钩 convertNitToBrightness 之前改 nit：既在全部 feature 之后（不会被覆盖），
     // 又在亮度换算之前（改完立刻生效），且与具体 feature 类名无关。
     private fun hookPostProcessBoost(classLoader: ClassLoader): Int = try {
-        val mgr = XposedHelpers.findClass(CLS_POST_MANAGER, classLoader)
-        var n = hookAll(mgr, "convertNitToBrightness", object : XC_MethodHook() {
+        val mgr = XpHelpers.findClass(CLS_POST_MANAGER, classLoader)
+        var n = hookAll(mgr, "convertNitToBrightness", object : XpHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 if (!enabled() || !hdrOn) return
                 val builder = param.args.getOrNull(0) ?: return
                 boost(param.thisObject, builder)
             }
         })
-        // 诊断：证明「后处理链到底有没有在跑」。C17 静默失效最常见的原因就是它压根没被调用。
-        n += hookAll(mgr, "postProcessing", object : XC_MethodHook() {
+        // 诊断：证明「后处理链到底有没有在跑」。只有 convertNitToBrightness 能证明兜底可挂载，
+        // 诊断钩子不计入返回值，否则 ColorOS 原生驱动失配时永远进不了 AOSP 兜底。
+        hookAll(mgr, "postProcessing", object : XpHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 if (!enabled() || !hdrOn) return
                 logEvery("mpp", 2000L) {
@@ -727,7 +752,7 @@ object HdrBoostHook {
         })
         n
     } catch (t: Throwable) {
-        XposedBridge.log("$TAG: post-processing manager not found: " + t.message)
+        Xp.log("$TAG: post-processing manager not found: " + t.message)
         0
     }
 
@@ -736,31 +761,32 @@ object HdrBoostHook {
     // 兜底路径是「被动」的：只有当系统重算亮度时才会经过 convertNitToBrightness。
     // 光切窗口 colorMode 不会必然触发一次重算，所以 HDR 开关后必须自己点一次火。
     private fun hookDisplayPowerController(classLoader: ClassLoader): Boolean = try {
-        val cls = XposedHelpers.findClass("com.android.server.display.DisplayPowerController", classLoader)
-        XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
+        val cls = XpHelpers.findClass("com.android.server.display.DisplayPowerController", classLoader)
+        Xp.hookAllConstructors(cls, object : XpHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val self = param.thisObject
                 dpc = self
                 try {
-                    dpcHandler = XposedHelpers.getObjectField(self, "mHandler") as? android.os.Handler
+                    dpcHandler = XpHelpers.getObjectField(self, "mHandler") as? android.os.Handler
                 } catch (_: Throwable) {
                 }
                 try {
-                    val cfg = XposedHelpers.getObjectField(self, "mDisplayDeviceConfig")
+                    val cfg = XpHelpers.getObjectField(self, "mDisplayDeviceConfig")
                     displayConfig = cfg
-                    hasRatioSpline = XposedHelpers.callMethod(
+                    hasRatioSpline = XpHelpers.callMethod(
                         cfg, "hasSdrToHdrRatioSpline"
                     ) as? Boolean ?: false
-                    XposedBridge.log(
+                    Xp.log(
                         "$TAG: panel config ready [sdrToHdrSpline=" + hasRatioSpline + "]"
                     )
-                    installSpecificSpline()
-                    updateSpecificMode()
-                    XposedBridge.log(
+                    if (aospMode && enabled()) {
+                        installSpecificSpline()
+                        updateSpecificMode()
+                    }
+                    Xp.log(
                         "$TAG: chain = " + when {
-                            specificOnlyChain -> "SPECIFIC-ONLY(系统自算, 无补偿钩子)"
-                            specificMode -> "SPECIFIC(系统自算)"
-                            else -> "GENERIC(模块代劳)"
+                            specOn() -> "SPECIFIC(系统自算, 运行时健康)"
+                            else -> "GENERIC(模块代劳, 兜底已安装)"
                         }
                     )
                 } catch (t: Throwable) {
@@ -770,12 +796,13 @@ object HdrBoostHook {
         })
         true
     } catch (t: Throwable) {
-        XposedBridge.log("$TAG: DisplayPowerController not found: " + t.message)
+        Xp.log("$TAG: DisplayPowerController not found: " + t.message)
         false
     }
 
     /** 让 DisplayPowerController 在自己的 handler 线程上重算一次亮度 */
     private fun requestPowerUpdate() {
+        if (!enabled()) return
         val d = dpc
         if (d == null) {
             logEvery("nodpc", 5000L) { "$TAG: no DPC instance, cannot request power update" }
@@ -783,7 +810,7 @@ object HdrBoostHook {
         }
         val run = Runnable {
             try {
-                XposedHelpers.callMethod(d, "updatePowerState")
+                XpHelpers.callMethod(d, "updatePowerState")
             } catch (t: Throwable) {
                 logEvery("updfail", 5000L) { "$TAG: updatePowerState failed: " + t }
             }
@@ -796,10 +823,13 @@ object HdrBoostHook {
         }
     }
 
-    private fun num(o: Any, getter: String): Float = try {
-        (XposedHelpers.callMethod(o, getter) as? Float) ?: Float.NaN
-    } catch (_: Throwable) {
-        Float.NaN
+    private fun num(objOrNull: Any?, getter: String): Float {
+        val o = objOrNull ?: return Float.NaN
+        return try {
+            (XpHelpers.callMethod(o, getter) as? Float) ?: Float.NaN
+        } catch (_: Throwable) {
+            Float.NaN
+        }
     }
 
     /** 面板 nit 硬件上限（带缓存） */
@@ -808,7 +838,7 @@ object HdrBoostHook {
         if (cached > 0f) return cached
         var v = Float.NaN
         try {
-            val model = XposedHelpers.getObjectField(mgr, "mBrightnessModel")
+            val model = XpHelpers.getObjectField(mgr, "mBrightnessModel")
             v = num(model, "getMaxPanelNit")
             if (v.isNaN() || v <= 0f) v = num(model, "getTotalBrightness")
         } catch (_: Throwable) {
@@ -820,7 +850,8 @@ object HdrBoostHook {
     /** 通用兜底是否允许。设 0 则只走 ColorOS 原生驱动（用于验证原生链路）。 */
     private fun fallbackEnabled(): Boolean = prop2(PROP_FALLBACK, PROP_FALLBACK_OLD, "1") != "0"
 
-    private fun boost(mgr: Any, builder: Any): Boolean {
+    private fun boost(mgrOrNull: Any?, builder: Any): Boolean {
+        val mgr = mgrOrNull ?: return false
         return try {
             // 专项链路下系统自己会算，兜底必须完全静默
             if (specOn()) {
@@ -867,11 +898,11 @@ object HdrBoostHook {
                 }
                 return false
             }
-            XposedHelpers.callMethod(builder, "setHasEdrProcessed")
-            XposedHelpers.callMethod(builder, "setSdrNit", base)
-            XposedHelpers.callMethod(builder, "setNit", target)
+            XpHelpers.callMethod(builder, "setHasEdrProcessed")
+            XpHelpers.callMethod(builder, "setSdrNit", base)
+            XpHelpers.callMethod(builder, "setNit", target)
             try {
-                XposedHelpers.callMethod(builder, "setReason", "FkHDR:HdrFix")
+                XpHelpers.callMethod(builder, "setReason", "FkHDR:HdrFix")
             } catch (_: Throwable) {
             }
             logEvery("boost", 1000L) {
@@ -887,29 +918,18 @@ object HdrBoostHook {
 
     // ── H. 类原生（AOSP）通路 ───────────────────────────────
     //
-    // AOSP 的比率链与 ColorOS 完全同构（ColorOS 就是在 AOSP 上做 ExtImpl）：
-    //   LocalDisplayAdapter$LocalDisplayDevice$1#setDisplayBrightness(float brightness, float sdrBrightness)
-    //     ├─ nits = backlightToNits(brightnessToBacklight(brightness))
-    //     ├─ sdrNits = backlightToNits(brightnessToBacklight(sdrBrightness))
-    //     ├─ mLocalDisplayDeviceExt.setDisplayBrightness(...)      ← OEM 钩子，AOSP 桩类空实现
-    //     └─ if (mLocalDisplayDeviceExt.isSupportSdrToHdrRatio() && nits!=0 && sdrNits!=0)
-    //             handleHdrSdrNitsChanged(nits, sdrNits)          ← 唯一的比率计算点
-    //
-    // 类原生上 isSupportSdrToHdrRatio() 默认 false → 比率永不计算 → App 看到恒 1.0。
-    // 所以类原生只需两步：
-    //   ① 把 isSupportSdrToHdrRatio() 掰成 true（打开比率计算）
-    //   ② 让 brightness != sdrBrightness（造出 HDR 峰值与 SDR 白点之差）
-    //
-    // ②的做法：把 brightness 抬到面板最大、sdrBrightness 保留用户亮度。
-    // AOSP 的 brightness 是归一化 0..1（BrightnessEvent 日志 brt=0.45882353），所以峰值取 1.0f。
-    // 仅在「OPPO 通路完全不可用」时启用，避免在 ColorOS 上误改 0..2047 量纲。
+    // 始终安装 GENERIC 兜底：requestDisplayStateLocked / setDisplayBrightness 捕获、
+    // 按精确 (float)->float 签名解析 nits 链、在 DisplayAdapter 的 SyncRoot 下发布比值。
+    // 专项链路只是运行时优化：spline 与比值接管都安装并验证成功后才抑制 GENERIC 补偿。
+    // 任何一步失败、曲线被系统换回、比值长时间无效，watcher 都会退回 GENERIC；
+    // AOSP 分支不强制 isSupportSdrToHdrRatio()（ColorOS 分支的 OPPO Ext 私有钩子是另一套设计），
+    // 绝不写 mSupportUltraHDR / mForceSurfaceControl。
     /** 内部类分隔符（避免 Kotlin 字符串模板把 $ 当插值） */
     private const val D = "$"
 
     @Volatile private var aospMode = false
     /** ColorOS 上 OPPO 通路全部失配（原生驱动 + 后处理都挂不上） */
     @Volatile private var oppoPathDead = false
-    @Volatile private var extHooked = false
 
     // ── AOSP 主动推送所需的设备快照 ────────────────────────
     // requestDisplayStateLocked 只在「屏幕状态或亮度发生变化」时才会被调用（DisplayPowerState
@@ -923,31 +943,30 @@ object HdrBoostHook {
     @Volatile private var aospFunnelSeen = false
 
     private fun hookAospLocalDisplay(classLoader: ClassLoader): String {
-        // ① 捕获 LocalDisplayDevice 实例 → 拿到 mLocalDisplayDeviceExt 的运行时类 → 挂闸门
-        //    同时在这一层改写 brightnessState：这是「面板亮度」进入设备的唯一漏斗，
-        //    且它上游 DisplayPowerState 只在亮度真变化时才调它 —— 见 ② 的主动推送。
+        // 捕获 LocalDisplayDevice 实例与 requestDisplayStateLocked 亮度漏斗；
+        // 同时从返回的 Runnable / 内部类动态解析亮度处理类。这里不再挂 OEM 比率闸门。
         var dev = 0
         try {
-            val cls = XposedHelpers.findClass(
+            val cls = XpHelpers.findClass(
                 "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice", classLoader
             )
-            dev = hookAll(cls, "requestDisplayStateLocked", object : XC_MethodHook() {
+            dev = hookAll(cls, "requestDisplayStateLocked", object : XpHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     onAospRequestState(param)
                 }
 
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    aospDev = param.thisObject
-                    hookExt(param.thisObject)
                     hookInnerDynamic(param.result)
+                    if (!enabled()) return
+                    aospDev = param.thisObject
                 }
             })
             if (dev == 0) {
                 // 退路：构造器
-                XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
+                Xp.hookAllConstructors(cls, object : XpHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        if (!enabled()) return
                         aospDev = param.thisObject
-                        hookExt(param.thisObject)
                     }
                 })
                 dev = -1
@@ -970,17 +989,20 @@ object HdrBoostHook {
     //      这样与类名、序号、ROM 改动都无关。
     @Volatile private var innerCls: Class<*>? = null
     @Volatile private var innerHooked = false
+    private val hookedInnerClasses = java.util.Collections.synchronizedSet(
+        java.util.HashSet<Class<*>>()
+    )
 
-    private val brightnessHook = object : XC_MethodHook() {
+    private val brightnessHook = object : XpHook() {
         override fun beforeHookedMethod(param: MethodHookParam) {
             if (!aospMode || !enabled() || !hdrOn) return
             // ★ 关键守卫：曲线装上后亮度必须完全交给 DPC。
             //   这里是「第二条硬推路径」——它作用在 $1.setDisplayBrightness 上，
             //   即使 DPC 已经算出正确的 HDR 目标亮度，也会被这里改写成面板最大，
             //   于是 nits 恒 650、比值恒被 cap 钉死，且退出 HDR 后没人把亮度改回来。
-            if (specOn() || splineInstalled) {
+            if (specOn()) {
                 logEvery("specnoBoost", 5000L) {
-                    "$TAG: setDisplayBrightness boost skipped (system-driven chain)"
+                    "$TAG: setDisplayBrightness boost skipped (healthy specific chain)"
                 }
                 return
             }
@@ -988,10 +1010,12 @@ object HdrBoostHook {
             if (args.size < 2) return
             val sdr = args[1] as? Float ?: return
             if (sdr.isNaN() || sdr <= 0f) return
-            // HDR 峰值 → 面板最大。量纲自适应：
-            //   AOSP 归一化 0..1（BrightnessEvent brt=0.45882353）→ peak=1.0
-            //   ColorOS 绝对 0..2047（mScreenBrightnessRangeMaximum）→ peak=该值
+            // 最后一层兜底：曲线目标没有送达时才按面板上限抬亮度，量纲自适应：
+            //   AOSP 归一化 0..1 → 1.0；ColorOS 绝对 0..2047 → mScreenBrightnessRangeMaximum。
+            //   若上面已有曲线目标（cur 已高于 sdr），下面的 cur > sdr 判断会直接跳过。
             val cur = args[0] as? Float ?: return
+            // onAospRequestState / pushAospBrightness 已算出曲线目标时不要再硬推到面板峰值。
+            if (cur > sdr * 1.001f) return
             val peak = if (cur > 1.5f) absMaxBrightness() else 1.0f
             if (peak <= sdr) return
             args[0] = peak
@@ -1008,46 +1032,36 @@ object HdrBoostHook {
     }
 
     private fun hookBrightnessInner(classLoader: ClassLoader): Int {
-        for (i in 1..9) {
-            val name = "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice" + D + i
-            val c = try {
-                XposedHelpers.findClass(name, classLoader)
-            } catch (_: Throwable) {
-                null
-            } ?: continue
-            val n = hookInner(c)
-            if (n > 0) return n
+        var total = 0
+        for (c in brightnessCandidates(classLoader)) {
+            total += hookInner(c)
         }
-        logEvery("aospbright", 60000L) {
-            "$TAG: setDisplayBrightness inner class not found by name; will hook dynamically on first Runnable"
+        if (total == 0) {
+            logEvery("aospbright", 60000L) {
+                "$TAG: setDisplayBrightness target not found by class scan; will hook dynamically on first Runnable"
+            }
         }
-        return 0
+        return total
     }
 
     private fun hookInner(cls: Class<*>): Int {
-        if (innerHooked) return 1
-        if (!hasMethod(cls, "setDisplayBrightness")) return 0
-        // 只按名字接受第一个类有风险：某些 adapter 也有同名方法但永不被调用。
-        // 真正的 LocalDisplayDevice$1 一定同时有 handleHdrSdrNitsChanged。
-        if (!hasMethod(cls, "handleHdrSdrNitsChanged")) {
-            logEvery("wronginner", 60000L) {
-                "$TAG: skip " + cls.name + " (setDisplayBrightness but no handleHdrSdrNitsChanged)"
-            }
-            return 0
-        }
+        if (!hookedInnerClasses.add(cls)) return 1
+        if (!hasMethodAny(cls, "setDisplayBrightness")) return 0
         val n = hookAll(cls, "setDisplayBrightness", brightnessHook)
         if (n > 0) {
             innerCls = cls
             innerHooked = true
-            XposedBridge.log("$TAG: brightness hook installed on " + cls.name + " (" + n + " method)")
+            Xp.log("$TAG: brightness hook installed on " + cls.name + " (" + n + " method)")
             hookHdrRatioProbe(cls)
+        } else {
+            hookedInnerClasses.remove(cls)
         }
         return n
     }
 
     /** requestDisplayStateLocked 返回的 Runnable 就是那个匿名类实例 —— 按运行时类动态挂 */
     private fun hookInnerDynamic(r: Any?) {
-        if (innerHooked || r == null) return
+        if (r == null) return
         try {
             hookInner(r.javaClass)
         } catch (_: Throwable) {
@@ -1058,13 +1072,15 @@ object HdrBoostHook {
      * requestDisplayStateLocked 的入参改写点。
      *
      * 形参：(int state, float brightnessState, float sdrBrightnessState[, DisplayOffloadSession])
-     *   brightnessState    → 面板背光（AOSP 归一化 0..1，1.0 = 面板物理最大 = HBM 区）
+     *   brightnessState    → 背光目标（归一化 0..1 或厂商绝对量纲，由运行时曲线决定）
      *   sdrBrightnessState → SDR 白点（保留用户当前亮度，不动）
      *
-     * 把前者抬到 1.0、后者保留用户值 → 面板变亮且 SDR 内容不变，
-     * 比值 = nits(1.0)/nits(用户) 才有意义。
+     * 专项链未验证时把 brightnessState 抬到 aospBoostTarget()：SDR nits × 上限曲线，
+     * 再用同一组 cfg 方法换回亮度；曲线不可用或目标与入参量纲不一致时保持原值，
+     * 不硬推 1.0，也不把绝对量纲设备压到接近全黑。
      */
-    private fun onAospRequestState(param: XC_MethodHook.MethodHookParam) {
+    private fun onAospRequestState(param: MethodHookParam) {
+        if (!aospMode || !enabled()) return
         val a = param.args
         if (a.size < 3) return
         val st = a[0] as? Int ?: return
@@ -1090,32 +1106,32 @@ object HdrBoostHook {
             // 会把 ratio 直接置 NaN（只剩物理提亮）。这条日志能一眼判定类原生上到底有没有比值能力。
             var sc = "?"
             try {
-                val ba = XposedHelpers.getObjectField(param.thisObject, "mBacklightAdapter")
-                val use = XposedHelpers.getBooleanField(ba, "mUseSurfaceControlBrightness")
+                val ba = XpHelpers.getObjectField(param.thisObject, "mBacklightAdapter")
+                val use = XpHelpers.getBooleanField(ba, "mUseSurfaceControlBrightness")
                 val force = try {
-                    XposedHelpers.getBooleanField(ba, "mForceSurfaceControl")
+                    XpHelpers.getBooleanField(ba, "mForceSurfaceControl")
                 } catch (_: Throwable) {
                     false
                 }
                 sc = "use=" + use + " force=" + force
             } catch (_: Throwable) {
             }
-            XposedBridge.log(
+            Xp.log(
                 "$TAG: aosp funnel alive (state=" + st + " brightness=" + f2(b) +
                     " sdr=" + f2(sdr) + " useSurfaceControlBrightness=" + sc + ")"
             )
         }
-        if (!aospMode || !enabled() || !hdrOn) return
+        if (!hdrOn) return
 
         // 曲线已装上（含通用链路）时：亮度完全交给 DPC。
         // 直写 args[1] 是硬跳变，没有 ramp；DPC 自己算出来的目标会走 BrightnessRamp 渐变，丝滑得多。
-        if (splineInstalled) {
+        if (specOn()) {
             logEvery("specgate", 3000L) {
                 var sc = "?"
                 try {
-                    val ba = XposedHelpers.getObjectField(param.thisObject, "mBacklightAdapter")
-                    sc = "use=" + XposedHelpers.getBooleanField(ba, "mUseSurfaceControlBrightness") +
-                        " force=" + XposedHelpers.getBooleanField(ba, "mForceSurfaceControl")
+                    val ba = XpHelpers.getObjectField(param.thisObject, "mBacklightAdapter")
+                    sc = "use=" + XpHelpers.getBooleanField(ba, "mUseSurfaceControlBrightness") +
+                        " force=" + XpHelpers.getBooleanField(ba, "mForceSurfaceControl")
                 } catch (_: Throwable) {
                 }
                 "$TAG: specific gate [b=" + f2(b) + " sdr=" + f2(sdr) + " " + sc + "]"
@@ -1124,27 +1140,14 @@ object HdrBoostHook {
         }
 
         val sdrEff = if (sdr.isFinite() && sdr > 0.001f) sdr else b
-        // 目标亮度 = SDR 亮度 × 上限曲线(sdrNits)，而不是硬推到面板最大。
-        // 这样 SDR 白点不动、比值被曲线封顶，行为与旧模块改 XML 完全一致。
-        val sdrNits = nitsOf(sdrEff)
-        val ratio = splineRatio(sdrNits)
-        // 曲线不可用时「不提亮」，而不是拉满 —— 拉满会让物理比值飙到几十（刺眼+发烫）
-        val target = brightnessOfNits(sdrNits * ratio).let {
-            if (it.isNaN() || it <= 0f) {
-                logEvery("curvefail", 5000L) {
-                    "$TAG: brightness curve unavailable, boost skipped (sdrNits=" + f2(sdrNits) + ")"
-                }
-                sdrEff
-            } else {
-                Math.min(it, peakBrightness())
-            }
-        }
+        // 与主动推送共用同一套曲线目标：SDR 白点不动、目标不超过面板上限。
+        // 曲线不可用时「不提亮」而不是拉满 —— 拉满会让物理比值飙到几十（刺眼+发烫）。
+        val target = aospBoostTarget(sdrEff)
         aospPeak = target
         if (target > sdrEff) {
             a[1] = target
             logEvery("aosppush", 2000L) {
-                "$TAG: aosp push " + f2(sdrEff) + " -> " + f2(target) +
-                    " (sdrNits=" + f2(sdrNits) + " ratio=" + f2(ratio) + ")"
+                "$TAG: aosp push " + f2(sdrEff) + " -> " + f2(target)
             }
         }
     }
@@ -1162,7 +1165,7 @@ object HdrBoostHook {
         // 开关关掉后绝不能继续推亮度（这里是自己塞 callArgs[1]，不经过 before-hook 的 enabled 检查）
         if (!enabled()) return
         // 曲线已装上：亮度交给 DPC 自己算，避免硬跳变（无 ramp）
-        if (specOn() || splineInstalled) return
+        if (specOn()) return
         val dev = aospDev
         if (dev == null) {
             logEvery("aospnodev", 5000L) {
@@ -1179,31 +1182,14 @@ object HdrBoostHook {
             requestPowerUpdate()
             return
         }
-        // 与被动改写保持同一套算法：目标 = SDR nits × 上限曲线，而不是硬推面板最大。
-        // 之前这里写死 1.0，导致面板被拉到顶、系统算出的 nits/sdrNits 巨大，
-        // 上报值只能靠 cap 兜底，看起来就像「比值被钉死在 5」。
-        val target = if (boost) {
-            val sdrNits = nitsOf(sdr)
-            val curve = splineRatio(sdrNits)
-            val t = brightnessOfNits(sdrNits * curve)
-            when {
-                t.isNaN() || t <= 0f -> {
-                    logEvery("curvefail2", 5000L) {
-                        "$TAG: push curve unavailable, fallback to sdr (no boost)"
-                    }
-                    sdr
-                }
-                t > 1.0f -> 1.0f
-                else -> t
-            }
-        } else {
-            sdr
-        }
+        // 与被动改写共用 aospBoostTarget()：不再把绝对量纲目标截断成 1.0，
+        // 也不在曲线/量纲不可信时硬推亮度，避免 ColorOS 0..2047 设备被压到接近全黑。
+        val target = if (boost) aospBoostTarget(sdr) else sdr
         // 状态必须取设备自己的 mState：随便传一个值会让 runnable 误以为要切换电源状态，
         // 在 DOZE/AOD 下可能把屏幕直接点亮。
         var st = aospState
         try {
-            st = XposedHelpers.getIntField(dev, "mState")
+            st = XpHelpers.getIntField(dev, "mState")
         } catch (_: Throwable) {
         }
         if (st != 2) {
@@ -1213,11 +1199,7 @@ object HdrBoostHook {
             }
             return
         }
-        val root = try {
-            XposedHelpers.callMethod(dev, "getSyncRoot")
-        } catch (_: Throwable) {
-            null
-        }
+        val root = syncRootOf(dev)
         val task = Runnable {
             try {
                 val m = dev.javaClass.declaredMethods.firstOrNull {
@@ -1260,9 +1242,8 @@ object HdrBoostHook {
                     synchronized(root) { exec() }
                 } else {
                     logEvery("nosyncroot", 30000L) {
-                        "$TAG: getSyncRoot unavailable, pushing brightness WITHOUT device lock"
+                        "$TAG: sync root unavailable, refusing to push brightness without lock"
                     }
-                    exec()
                 }
             } catch (t: Throwable) {
                 logEvery("aosppushfail", 3000L) { "$TAG: aosp push failed: " + t }
@@ -1288,7 +1269,7 @@ object HdrBoostHook {
         val d = dpc ?: return 1.0f
         for (f in arrayOf("mScreenBrightnessRangeMaximum", "mScreenBrightnessNormalMaximum")) {
             try {
-                val v = XposedHelpers.getFloatField(d, f)
+                val v = XpHelpers.getFloatField(d, f)
                 if (v > 1.5f) return v
             } catch (_: Throwable) {
             }
@@ -1296,197 +1277,122 @@ object HdrBoostHook {
         return 1.0f
     }
 
-    /**
-     * 把运行时 Ext 类的 isSupportSdrToHdrRatio 掰成 true（不依赖具体类名，通吃 AOSP/ColorOS/OEM）。
-     *
-     * AOSP 的比率计算点在 LocalDisplayDevice#setDisplayBrightness：
-     *     if (mLocalDisplayDeviceExt.isSupportSdrToHdrRatio() && nits != 0 && sdrNits != 0)
-     *         handleHdrSdrNitsChanged(nits, sdrNits);
-     * 类原生上该方法返回 false → 比率恒 1.0。闸门不开，光把面板推亮也不会产生 HDR 比值。
-     *
-     * 字段名在不同 ROM 上可能是 mLocalDisplayDeviceExt / mLocalDisplayDeviceExtImpl，
-     * 类型可能是 class 也可能是 interface —— 因此按名字找不到时按类型名扫描一遍。
-     * 失败必须留下日志：旧实现 catch 后静默 return，导致「看起来挂上了其实什么都没做」。
-     */
-    private fun hookExt(devObj: Any?) {
-        if (extHooked || devObj == null) return
-        try {
-            val ext = findExt(devObj)
-            if (ext == null) {
-                extHooked = true
-                val fields = try {
-                    devObj.javaClass.declaredFields.joinToString(",") { it.name }
-                } catch (_: Throwable) {
-                    "?"
-                }
-                XposedBridge.log(
-                    "$TAG: aosp ratio gate SKIPPED: no LocalDisplayDeviceExt field on " +
-                        devObj.javaClass.name + " fields=[" + fields + "]"
-                )
-                return
-            }
-            val extCls = ext.javaClass
-            val n = XposedBridge.hookAllMethods(extCls, "isSupportSdrToHdrRatio", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (enabled()) param.result = true
-                }
-            }).size
-            extHooked = true
-            if (n > 0) {
-                XposedBridge.log(
-                    "$TAG: aosp ratio gate opened on " + extCls.name + " (" + n + " method)"
-                )
-            } else {
-                val cand = try {
-                    extCls.declaredMethods.map { it.name }.filter { it.contains("Ratio", true) }
-                        .distinct().joinToString(",")
-                } catch (_: Throwable) {
-                    "?"
-                }
-                XposedBridge.log(
-                    "$TAG: aosp ratio gate MISSING: " + extCls.name +
-                        " has no isSupportSdrToHdrRatio; ratio-ish methods=[" + cand + "]"
-                )
-            }
-        } catch (t: Throwable) {
-            extHooked = true
-            XposedBridge.log("$TAG: aosp ratio gate failed: " + t)
-        }
-    }
-
-    // ── AOSP 比值：绕开闸门直接算 ───────────────────────────
+    // ── AOSP 比值：GENERIC 兜底自己算 ───────────────────────
     //
-    // AOSP 的 setDisplayBrightness 末尾是：
-    //     if (getDisplayDeviceConfig().hasSdrToHdrRatioSpline()) handleHdrSdrNitsChanged(nits, sdrNits);
-    // 实测（LineageOS 23 / v1.9.2）：hook 了 hasSdrToHdrRatioSpline 并返回 true，但
-    // handleHdrSdrNitsChanged 依然一次都没被调用 —— 说明这个调用点被 ART 内联成常量 false，
-    // 挂在被调方上不生效。因此改为「自己算、自己调」：
-    //     brightnessToBacklight(b) → backlightToNits(backlight) → handleHdrSdrNitsChanged(nits, sdrNits)
-    // 这三个都是 $1 上的方法（私有/包私有），反射可调；不依赖任何面板配置声明。
-    @Volatile private var ratioB2B: java.lang.reflect.Method? = null
-    @Volatile private var ratioB2N: java.lang.reflect.Method? = null
-    @Volatile private var ratioApply: java.lang.reflect.Method? = null
+    // 历史上 hook DisplayDeviceConfig.hasSdrToHdrRatioSpline() 返回 true 并不能让
+    // handleHdrSdrNitsChanged 被调用（调用点可能被 ART 内联）。因此 GENERIC 兜底
+    // 直接从 setDisplayBrightness 的入参解析 nits 链，按 AOSP 公式算比值：
+    //     brightnessToBacklight(b) → backlightToNits(backlight) → max(1, nits/sdrNits)
+    // 方法按精确 (float)->float 签名在 inner / LocalDisplayDevice / DisplayDeviceConfig
+    // 上动态解析，兼容两组常见命名，不硬编码匿名类序号。
+    // 专项链健康时 specOn() 会短路本函数，避免与系统自算双写。
     @Volatile private var ratioResolved = false
-    /** 上次真正写入的比值；用来把 display-changed 事件降到只在比值变化时发一次 */
     @Volatile private var lastForcedRatio = Float.NaN
-    /** 上次真正写入的时间；亮度渐变（ramp）期间每帧都会调进来，必须再加时间节流 */
     @Volatile private var lastForceAt = 0L
-    /** 两次 display-changed 之间的最小间隔（ms）。MIUI 桌面收到密集事件会 NPE 崩溃 */
     private const val FORCE_MIN_INTERVAL_MS = 500L
-    /** 被节流丢弃的「最新比值」，节流窗口结束时补写一次，否则 ramp 末值会永久丢失 */
-    @Volatile private var pendingRatio = Float.NaN
-    /** 系统最近一次把 mCurrentHdrSdrRatio 写成 NaN 的时间（P0-3：兜底判据用） */
-    @Volatile private var sysRatioNaNSince = 0L
-    /** HDR 状态翻转代数：延迟回调只在代数未变时才执行 */
-    @Volatile private var stateGen = 0
+    @Volatile private var lastRatioResolveAt = 0L
+    @Volatile private var stateGen = 0L
 
     private val trailHandler: android.os.Handler by lazy {
         android.os.Handler(android.os.Looper.getMainLooper())
     }
 
-    /** 节流补写：把被丢弃的最后一个比值补上 */
-    private val trailRunnable = Runnable {
-        val p = pendingRatio
-        pendingRatio = Float.NaN
-        if (!p.isNaN()) {
-            lastForceAt = android.os.SystemClock.elapsedRealtime()
-            lastForcedRatio = p
-            forceHdrSdrRatio(p)
-            logEvery("trail", 3000L) { "$TAG: ratio trailing write " + f2(p) }
-        }
-    }
+    private data class PendingRatio(val dev: Any, val ratio: Float)
+    private val pendingRatio = java.util.concurrent.atomic.AtomicReference<PendingRatio?>(null)
 
-    private fun pushRatioDirect(inner: Any, args: Array<Any?>) {
-        if (!aospMode || !enabled()) return
-        // HDR 期间必算；HDR 结束后 5s 内也算一次，把比值收回 1.0
-        if (!hdrOn && android.os.SystemClock.elapsedRealtime() >= gateUntil) return
-        try {
-            if (!ratioResolved) {
-                val cls = inner.javaClass
-                ratioB2B = cls.declaredMethods.firstOrNull { it.name == "brightnessToBacklight" }
-                    ?.also { it.isAccessible = true }
-                ratioB2N = cls.declaredMethods.firstOrNull { it.name == "backlightToNits" }
-                    ?.also { it.isAccessible = true }
-                ratioApply = cls.declaredMethods.firstOrNull { it.name == "handleHdrSdrNitsChanged" }
-                    ?.also { it.isAccessible = true }
-                if (ratioB2B != null && ratioB2N != null && ratioApply != null) {
-                    ratioResolved = true
-                    XposedBridge.log("$TAG: ratio direct ready (all 3 methods resolved)")
+    private val trailRunnable: Runnable = Runnable {
+        val p = pendingRatio.getAndSet(null)
+        if (p != null) {
+            if (enabled() && (hdrOn || android.os.SystemClock.elapsedRealtime() < gateUntil)) {
+                if (forceHdrSdrRatio(p.dev, p.ratio)) {
+                    lastForceAt = android.os.SystemClock.elapsedRealtime()
+                    lastForcedRatio = p.ratio
+                    logEvery("trail", 3000L) { "$TAG: ratio trailing write " + f2(p.ratio) }
                 } else {
-                    logEvery("rationotready", 30000L) {
-                        "$TAG: ratio direct NOT ready on " + inner.javaClass.name +
-                            " (b2b=" + (ratioB2B != null) + " b2n=" + (ratioB2N != null) +
-                            " apply=" + (ratioApply != null) + ")"
-                    }
-                }
-            }
-            val b2b = ratioB2B
-            val b2n = ratioB2N
-            val apply = ratioApply
-            if (b2b == null || b2n == null || apply == null) return
-            val b = args.getOrNull(0) as? Float ?: return
-            val sdr = args.getOrNull(1) as? Float ?: return
-            if (b.isNaN() || sdr.isNaN()) return
-            val backlight = b2b.invoke(inner, b) as? Float ?: return
-            val sdrBacklight = b2b.invoke(inner, sdr) as? Float ?: return
-            val nits = b2n.invoke(inner, backlight) as? Float ?: return
-            val sdrNits = b2n.invoke(inner, sdrBacklight) as? Float ?: return
-            // 注意：apply.invoke 内部会 updateDeviceInfoLocked -> sendDisplayDeviceEventLocked，
-            // 也就是一次 display-changed。它必须和 forceHdrSdrRatio 一样受节流约束，
-            // 否则 mUseSurfaceControlBrightness=true 的机型上仍会每帧发一次事件。
-            // 系统内部还有两道我们绕不开的条件：
-            //   handleHdrSdrNitsChanged 里要求 (mUseSurfaceControlBrightness || mForceSurfaceControl)，
-            //   小米还额外要求 mSupportUltraHDR（旧模块就是靠反编译删掉这一条）。
-            // 本机实测 mUseSurfaceControlBrightness=false -> 系统会把比值直接写成 NaN。
-            // 所以这里再补一步：直接把 mCurrentHdrSdrRatio 写进 LocalDisplayDevice 并刷新 DeviceInfo，
-            // 与任何内部条件无关。App 最终读到的就是这个值。
-            // 系统公式 max(1, nits/sdrNits)，再按 App 设定的上限封顶
-            val raw = if (sdrNits > 0f) Math.max(1f, nits / sdrNits) else 1f
-            val ratio = Math.min(raw, ratioCap())
-            // 只在比值「真的变了」才写。
-            // 每次写都会走 updateDeviceInfoLocked -> sendDisplayDeviceEventLocked ->
-            // 所有应用收到 onDisplayChanged；实测 MIUI 桌面（com.miui.home）会在
-            // DeviceHelper.isCarWithScreen 抛 NPE 崩掉。所以必须把事件降到最低频。
-            val last = lastForcedRatio
-            val now = android.os.SystemClock.elapsedRealtime()
-            // ① 比值变化 > 0.05 才写（避免无意义事件）
-            // ② 两次写入至少间隔 FORCE_MIN_INTERVAL_MS：
-            //    亮度渐变期间 setDisplayBrightness 每帧都会调进来，比值也每帧变一点点，
-            //    只靠 ① 仍会形成每帧一次的 display-changed 风暴（MIUI 桌面会崩）。
-            val changed = last.isNaN() || Math.abs(ratio - last) > 0.05f
-            val cooled = now - lastForceAt >= FORCE_MIN_INTERVAL_MS
-            // 专项链路：系统自己算，我们只在它「算不出」时兜底。
-            // 注意不能只看 currentHdrSdrRatio().isNaN() —— hookRatioNeverNaN 会把 NaN 归一成 1.0，
-            // 那样就永远判不出「系统没算」。所以用「最近 1.5s 内系统写过 NaN」作为判据。
-            val needFallback = if (specOn()) {
-                (now - sysRatioNaNSince) < 1500L ||
-                    currentHdrSdrRatio().let { it.isNaN() || it <= 0f }
-            } else {
-                true
-            }
-            when {
-                !needFallback -> Unit                      // 系统自己给了，不干预
-                !changed -> Unit                           // 没变化，不写
-                cooled -> {
-                    // 先让系统自己走一遍（保留 notifyBacklightAnimFinished 等副作用），再兜底写字段
-                    try {
-                        apply.invoke(inner, nits, sdrNits)
-                    } catch (_: Throwable) {
-                    }
-                    lastForceAt = now
-                    lastForcedRatio = ratio
-                    forceHdrSdrRatio(ratio)
-                }
-                else -> {
-                    // 被节流：记下最新值，窗口结束时补写，避免 ramp 末值被永久丢掉（P0-1）
-                    pendingRatio = ratio
-                    trailHandler.removeCallbacks(trailRunnable)
+                    pendingRatio.set(p)
                     trailHandler.postDelayed(trailRunnable, FORCE_MIN_INTERVAL_MS)
                 }
             }
+        }
+    }
+
+    private fun pushRatioDirect(innerOrNull: Any?, args: Array<Any?>) {
+        val inner = innerOrNull ?: return
+        if (!aospMode || !enabled() || specOn()) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (!hdrOn && now >= gateUntil) return
+        try {
+            val dev = localDeviceOf(inner)
+            if (dev == null) {
+                logEvery("rationodev", 30000L) { "$TAG: ratio direct skipped: LocalDisplayDevice unresolved" }
+                return
+            }
+            if (findFieldUp(dev.javaClass, "mCurrentHdrSdrRatio") == null) {
+                logEvery("rationofield", 30000L) { "$TAG: ratio direct skipped: mCurrentHdrSdrRatio missing" }
+                return
+            }
+            val cfg = displayConfig
+            val b2b = floatUnary(inner, arrayOf("brightnessToBacklight"))
+                ?: floatUnary(dev, arrayOf("brightnessToBacklight"))
+                ?: cfg?.let { floatUnary(it, arrayOf("getBacklightFromBrightness")) }
+            val b2n = floatUnary(inner, arrayOf("backlightToNits"))
+                ?: floatUnary(dev, arrayOf("backlightToNits"))
+                ?: cfg?.let { floatUnary(it, arrayOf("getNitsFromBacklight")) }
+            if (b2b == null || b2n == null) {
+                if (!ratioResolved && now - lastRatioResolveAt >= 3000L) {
+                    lastRatioResolveAt = now
+                    logEvery("rationotready", 30000L) {
+                        "$TAG: ratio direct NOT ready on " + inner.javaClass.name +
+                            " (b2b=" + (b2b != null) + " b2n=" + (b2n != null) + ")"
+                    }
+                }
+                ratioResolved = false
+                return
+            }
+            if (!ratioResolved) {
+                ratioResolved = true
+                Xp.log("$TAG: ratio direct ready (float->float methods resolved by signature)")
+            }
+            val b = args.getOrNull(0) as? Float ?: return
+            val sdr = args.getOrNull(1) as? Float ?: return
+            if (b.isNaN() || sdr.isNaN()) return
+            val backlight = b2b.first.invoke(b2b.second, b) as? Float ?: return
+            val sdrBacklight = b2b.first.invoke(b2b.second, sdr) as? Float ?: return
+            val nits = b2n.first.invoke(b2n.second, backlight) as? Float ?: return
+            val sdrNits = b2n.first.invoke(b2n.second, sdrBacklight) as? Float ?: return
+            val ratio = if (nits != -1f && sdrNits != -1f && nits.isFinite() &&
+                sdrNits.isFinite() && sdrNits > 0f
+            ) {
+                Math.max(1f, nits / sdrNits).takeIf { it.isFinite() } ?: Float.NaN
+            } else {
+                Float.NaN
+            }
+            if (ratioEquals(currentHdrSdrRatio(dev), ratio)) return
+            val last = lastForcedRatio
+            val changed = when {
+                ratio.isNaN() -> !last.isNaN()
+                last.isNaN() -> true
+                else -> Math.abs(ratio - last) > 0.05f
+            }
+            if (!changed) return
+            val cooled = now - lastForceAt >= FORCE_MIN_INTERVAL_MS
+            if (cooled) {
+                if (forceHdrSdrRatio(dev, ratio)) {
+                    lastForceAt = now
+                    lastForcedRatio = ratio
+                } else {
+                    pendingRatio.set(PendingRatio(dev, ratio))
+                    trailHandler.removeCallbacks(trailRunnable)
+                    trailHandler.postDelayed(trailRunnable, FORCE_MIN_INTERVAL_MS)
+                }
+            } else {
+                pendingRatio.set(PendingRatio(dev, ratio))
+                trailHandler.removeCallbacks(trailRunnable)
+                trailHandler.postDelayed(trailRunnable, FORCE_MIN_INTERVAL_MS)
+            }
             logEvery("ratio2", 2000L) {
                 "$TAG: ratio direct nits=" + f2(nits) + " sdrNits=" + f2(sdrNits) +
-                    " -> ratio=" + f2(ratio) + " current=" + f2(currentHdrSdrRatio())
+                    " -> ratio=" + f2(ratio) + " current=" + f2(currentHdrSdrRatio(dev))
             }
         } catch (t: Throwable) {
             logEvery("ratiofail", 10000L) { "$TAG: ratio direct failed: " + t }
@@ -1494,69 +1400,69 @@ object HdrBoostHook {
     }
 
     /**
-     * 直接把比值写进 LocalDisplayDevice，绕开所有内部条件。
-     *
-     * AOSP 的 handleHdrSdrNitsChanged 有三道门：
-     *   ① displayNits/sdrNits != INVALID_NITS
-     *   ② mBacklightAdapter.mUseSurfaceControlBrightness || mForceSurfaceControl
-     *   ③ 小米私有：LocalDisplayAdapter.mSupportUltraHDR
-     * 本机 ② 就是 false，所以系统自己算出来的永远是 NaN。这里跳过它，直接写字段 + 刷新 DeviceInfo。
+     * GENERIC 兜底：把有效比值写进 LocalDisplayDevice，保留 AOSP 的 NaN 语义。
+     * 只在拿到 DisplayAdapter 的 SyncRoot 且字段存在时写；拿不到锁就让系统原路径继续。
      */
-    private fun forceHdrSdrRatio(ratio: Float) {
+    private fun forceHdrSdrRatio(dev: Any?, ratio: Float): Boolean {
+        if (!enabled()) return false
         try {
-            // 不要用 $1.this$0 取外层：匿名内部类的合成字段名在不同编译器/混淆下不一样
-            // （本机实测 NoSuchFieldError: LocalDisplayDevice$1#this$0）。
-            // aospDev 是 requestDisplayStateLocked 的 thisObject，天然就是 LocalDisplayDevice。
-            val dev = aospDev ?: run {
+            val d = dev ?: run {
                 logEvery("rationodev", 10000L) { "$TAG: force ratio skipped: no LocalDisplayDevice" }
-                return
+                return false
             }
-            val root = try {
-                XposedHelpers.callMethod(dev, "getSyncRoot")
-            } catch (_: Throwable) {
-                null
+            if (findFieldUp(d.javaClass, "mCurrentHdrSdrRatio") == null) return false
+            val root = syncRootOf(d)
+            if (root == null) {
+                logEvery("norootforce", 30000L) { "$TAG: sync root unavailable, refusing unlocked ratio write" }
+                return false
             }
+            var ok = false
             val apply = Runnable {
                 var step = "set"
                 try {
-                    XposedHelpers.setFloatField(dev, "mCurrentHdrSdrRatio", ratio)
+                    XpHelpers.setFloatField(d, "mCurrentHdrSdrRatio", ratio)
                     step = "updateDeviceInfo"
-                    XposedHelpers.callMethod(dev, "updateDeviceInfoLocked")
-                    step = "readback"
-                    // 注意：不要再手动 sendDisplayDeviceEventLocked —— updateDeviceInfoLocked
-                    // 内部已经发过一次，重复发会让所有应用收到两次 onDisplayChanged。
-                    val info = XposedHelpers.getObjectField(dev, "mInfo")
-                    val back = XposedHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
-                    val infoBack = try {
-                        XposedHelpers.getFloatField(info, "hdrSdrRatio")
-                    } catch (_: Throwable) {
-                        Float.NaN
-                    }
-                    logEvery("ratioforceok", 3000L) {
-                        "$TAG: ratio forced " + f2(ratio) + " on " + dev.javaClass.simpleName +
-                            " (field=" + f2(back) + " info=" + f2(infoBack) + ")"
+                    XpHelpers.callMethod(d, "updateDeviceInfoLocked")
+                    ok = true
+                    // 诊断读回只用于日志：它的异常不能把已成功的写入判成失败，
+                    // 否则 pushRatioDirect 会误排队重写同一个比值。
+                    try {
+                        val info = XpHelpers.getObjectField(d, "mInfo")
+                        val back = XpHelpers.getFloatField(d, "mCurrentHdrSdrRatio")
+                        val infoBack = try {
+                            XpHelpers.getFloatField(info, "hdrSdrRatio")
+                        } catch (_: Throwable) {
+                            Float.NaN
+                        }
+                        logEvery("ratioforceok", 3000L) {
+                            "$TAG: ratio forced " + f2(ratio) + " on " + d.javaClass.simpleName +
+                                " (field=" + f2(back) + " info=" + f2(infoBack) + ")"
+                        }
+                    } catch (t: Throwable) {
+                        logEvery("ratioforceprobe", 10000L) {
+                            "$TAG: ratio readback probe failed (write already applied): " + t
+                        }
                     }
                 } catch (t: Throwable) {
                     logEvery("ratioforce", 10000L) { "$TAG: force ratio failed at " + step + ": " + t }
                 }
             }
-            if (root != null) {
-                synchronized(root) { apply.run() }
-            } else {
-                apply.run()
-            }
+            synchronized(root) { apply.run() }
+            return ok
         } catch (t: Throwable) {
             logEvery("ratioforce2", 10000L) { "$TAG: force ratio failed: " + t }
+            return false
         }
     }
 
-    /** 读回 LocalDisplayDevice.mCurrentHdrSdrRatio（App 最终看到的值） */
-    private fun currentHdrSdrRatio(): Float = try {
-        val dev = aospDev ?: return Float.NaN
-        XposedHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
+    private fun currentHdrSdrRatio(dev: Any?): Float = try {
+        val d = dev ?: return Float.NaN
+        XpHelpers.getFloatField(d, "mCurrentHdrSdrRatio")
     } catch (_: Throwable) {
         Float.NaN
     }
+
+    private fun currentHdrSdrRatio(): Float = currentHdrSdrRatio(aospDev)
 
     // ── 面板 nits 曲线 + 上限曲线（与旧模块「改 displayconfig」等价，但走系统逻辑）──
     //
@@ -1578,35 +1484,39 @@ object HdrBoostHook {
     @Volatile private var cfgMtdBacklightFromNits: java.lang.reflect.Method? = null
     @Volatile private var cfgMtdBrightnessFromBacklight: java.lang.reflect.Method? = null
     @Volatile private var cfgMethodsResolved = false
+    @Volatile private var cfgMethodsFor: Any? = null
 
     private fun resolveCfgMethods(): Boolean {
-        if (cfgMethodsResolved) return panelMaxNits > 0f
         val cfg = displayConfig ?: return false
+        if (cfgMethodsResolved && cfgMethodsFor === cfg) return panelMaxNits > 0f
+        cfgMethodsResolved = false
+        cfgMethodsFor = null
         try {
-            val c = cfg.javaClass
-            val F = java.lang.Float.TYPE
-            cfgMtdNits = c.getMethod("getNitsFromBacklight", F)
-            cfgMtdBacklight = c.getMethod("getBacklightFromBrightness", F)
-            cfgMtdBacklightFromNits = c.getMethod("getBacklightFromNits", F)
-            cfgMtdBrightnessFromBacklight = c.getMethod("getBrightnessFromBacklight", F)
+            cfgMtdNits = floatUnary(cfg, arrayOf("getNitsFromBacklight"))?.first
+            cfgMtdBacklight = floatUnary(cfg, arrayOf("getBacklightFromBrightness"))?.first
+            cfgMtdBacklightFromNits = floatUnary(cfg, arrayOf("getBacklightFromNits"))?.first
+            cfgMtdBrightnessFromBacklight = floatUnary(cfg, arrayOf("getBrightnessFromBacklight"))?.first
+            if (cfgMtdNits == null || cfgMtdBacklight == null ||
+                cfgMtdBacklightFromNits == null || cfgMtdBrightnessFromBacklight == null
+            ) return false
             val bl0 = cfgMtdBacklight!!.invoke(cfg, 0.0f) as Float
             val bl1 = cfgMtdBacklight!!.invoke(cfg, 1.0f) as Float
             val n0 = cfgMtdNits!!.invoke(cfg, bl0) as Float
             val n1 = cfgMtdNits!!.invoke(cfg, bl1) as Float
-            if (n1 > 0f && n1 > n0) {
-                panelMinNits = n0
-                panelMaxNits = n1
-            }
+            if (n0 < 0f || !n0.isFinite() || n1 <= 0f || !n1.isFinite() || n1 <= n0) return false
+            panelMinNits = n0
+            panelMaxNits = n1
             cfgMethodsResolved = true
-            XposedBridge.log(
+            cfgMethodsFor = cfg
+            Xp.log(
                 "$TAG: panel nits curve [min=" + f2(n0) + " max=" + f2(n1) +
                     "] ratioCap=" + f2(ratioCap())
             )
+            return true
         } catch (t: Throwable) {
             logEvery("cfgmtd", 60000L) { "$TAG: panel nits curve unavailable: " + t }
             return false
         }
-        return panelMaxNits > 0f
     }
 
     /**
@@ -1633,6 +1543,35 @@ object HdrBoostHook {
         cfgMtdBrightnessFromBacklight!!.invoke(cfg, bl) as Float
     } catch (_: Throwable) {
         Float.NaN
+    }
+
+    /**
+     * 被动改写与主动推送共用的 HDR 亮度目标，返回值与入参 sdr 同一量纲。
+     *
+     * AOSP 的 getBrightnessFromBacklight() 返回 framework 0..1；部分 OEM 把
+     * requestDisplayStateLocked 的 brightness 改成「名义 nit」(0..2047)。两条链若量纲
+     * 不一致，直接把 t 推回去会把屏幕压到接近全黑。因此只在 t 确实高于 sdr 且
+     * clamp 后仍高于 sdr 时提亮，否则保持 sdr 让系统自己的亮度链继续工作。
+     */
+    private fun aospBoostTarget(sdr: Float): Float {
+        val sdrNits = nitsOf(sdr)
+        val ratio = splineRatio(sdrNits)
+        val t = brightnessOfNits(sdrNits * ratio)
+        if (!t.isFinite() || t <= 0f) {
+            logEvery("curvefail", 5000L) {
+                "$TAG: brightness curve unavailable, boost skipped (sdrNits=" + f2(sdrNits) + ")"
+            }
+            return sdr
+        }
+        val capped = Math.min(t, peakBrightness())
+        if (capped <= sdr) {
+            logEvery("curvescale", 5000L) {
+                "$TAG: boost skipped (target=" + f2(capped) + " sdr=" + f2(sdr) +
+                    "): no gain or brightness-domain mismatch"
+            }
+            return sdr
+        }
+        return capped
     }
 
     /** App 可配的封顶上限（Settings.System:hdr_ratio_max，默认 5.0 = 旧模块的值） */
@@ -1668,37 +1607,106 @@ object HdrBoostHook {
         return cap + (1f - cap) * t
     }
 
-    // ══ 专项链路（复刻「改 displayconfig + 反编译 jar」的做法，但全程运行时）══
+    // ══ 专项链路（运行时验证通过后让系统自算；GENERIC 始终保留）══
     //
-    // 旧模块在这个系统上做的事只有两件：
-    //   ① display_id_*.xml 里 sdrHdrRatioMap：2 nits -> 5.0，650 nits -> 1.0
-    //   ② services.jar 里删掉 handleHdrSdrNitsChanged 的 "&& mSupportUltraHDR" 门禁
-    // 做完这两件事后，提亮与比值**全部由系统自己完成**，模块不再干预亮度。
-    //
-    // 我们等价实现：
-    //   ① 运行时替换 DisplayDeviceConfig.mSdrToHdrRatioSpline（同一条曲线，cap 由 App 配）
-    //   ② 把 LocalDisplayAdapter.mSupportUltraHDR 置 true（等效于删掉那个与条件）
-    //   ③ 只保留 mIsHdrLayerPresent 强制（等价于 XML 里 minimumHdrPercentOfScreen=0 的意图）
-    // 之后：DPC 用曲线算 HDR 目标亮度 -> setDisplayBrightness -> 系统自己算 nits/sdrNits。
-    // 我们不再推亮度、不再写比值，除非专项链路自检失败（才退回通用链路）。
+    // 旧模块改 display_id_*.xml 的 sdrHdrRatioMap 并反编译 services.jar 删门禁。
+    // v1.6.2 不复制「改 jar」这一步，绝不写 mSupportUltraHDR / mForceSurfaceControl
+    // （历史上强切亮度通路会黑屏）：
+    //   ① 运行时找到 spline 字段后替换曲线，x 轴来自面板 nits，不写死 [2,650]；
+    //   ② 接管 handleHdrSdrNitsChanged，按 AOSP 公式算比值并在 SyncRoot 内发布；
+    //   ③ 只有 splineInstalled + ratioBypassInstalled + ratioBypassVerified 全部成立，
+    //      且本次 HDR 会话没有触发 specFallback，specOn() 才抑制 GENERIC 补偿。
+    // watcher 发现曲线被换回、比值 2 秒仍无效或开关关闭时，立即退回始终安装的 GENERIC。
+    // 字段形状兼容 AOSP15 的 DisplayDeviceConfig.mSdrToHdrRatioSpline 与 OEM 的
+    // mHbmData / mHdrBrightnessData.sdrToHdrRatioSpline。
     @Volatile private var specificMode = false
     @Volatile private var splineInstalled = false
-    @Volatile private var ultraHdrForced = false
 
-    /** ① 替换面板的 sdr->hdr 比值曲线（等效旧模块改 XML） */
-    /** 取显示设备的同步根：getSyncRoot() 在 DisplayAdapter 上，不在 device 上 */
-    private fun syncRootOf(dev: Any): Any? {
-        try {
-            val adapter = XposedHelpers.getObjectField(dev, "this" + D + "0")
-            return XposedHelpers.callMethod(adapter, "getSyncRoot")
-        } catch (_: Throwable) {
-        }
-        try {
-            val adapter = XposedHelpers.getObjectField(dev, "this" + D + "0")
-            return XposedHelpers.getObjectField(adapter, "mSyncRoot")
-        } catch (_: Throwable) {
+    private fun outerOf(obj: Any): Any? {
+        var k: Class<*>? = obj.javaClass
+        while (k != null) {
+            for (f in k.declaredFields) {
+                if (java.lang.reflect.Modifier.isStatic(f.modifiers)) continue
+                val maybeOuter = f.isSynthetic || f.name.startsWith("this") ||
+                    f.type.name.contains("LocalDisplayDevice")
+                if (!maybeOuter) continue
+                try {
+                    f.isAccessible = true
+                    val v = f.get(obj) ?: continue
+                    if (v !== obj && findFieldUp(v.javaClass, "mCurrentHdrSdrRatio") != null) return v
+                } catch (_: Throwable) {
+                }
+            }
+            k = k.superclass
         }
         return null
+    }
+
+    private fun localDeviceOf(objOrNull: Any?): Any? {
+        val obj = objOrNull ?: return null
+        if (findFieldUp(obj.javaClass, "mCurrentHdrSdrRatio") != null) return obj
+        return outerOf(obj) ?: aospDev
+    }
+
+    private fun adapterOf(dev: Any): Any? {
+        var k: Class<*>? = dev.javaClass
+        while (k != null) {
+            for (f in k.declaredFields) {
+                if (java.lang.reflect.Modifier.isStatic(f.modifiers)) continue
+                val maybeAdapter = f.isSynthetic || f.name.startsWith("this") ||
+                    f.type.name.contains("DisplayAdapter")
+                if (!maybeAdapter) continue
+                try {
+                    f.isAccessible = true
+                    val v = f.get(dev) ?: continue
+                    if (v !== dev && (hasMethodAny(v.javaClass, "getSyncRoot") ||
+                            findFieldUp(v.javaClass, "mSyncRoot") != null)
+                    ) return v
+                } catch (_: Throwable) {
+                }
+            }
+            k = k.superclass
+        }
+        return null
+    }
+
+    private fun syncRootOf(dev: Any): Any? {
+        val candidates = ArrayList<Any>()
+        adapterOf(dev)?.let { candidates.add(it) }
+        candidates.add(dev)
+        for (o in candidates) {
+            try {
+                val m = o.javaClass.getMethod("getSyncRoot")
+                val root = m.invoke(o)
+                if (root != null) return root
+            } catch (_: Throwable) {
+            }
+            try {
+                val f = findFieldUp(o.javaClass, "mSyncRoot") ?: continue
+                val root = f.get(o)
+                if (root != null) return root
+            } catch (_: Throwable) {
+            }
+        }
+        return null
+    }
+
+    private fun ratioEquals(a: Float, b: Float): Boolean = when {
+        a.isNaN() || b.isNaN() -> a.isNaN() && b.isNaN()
+        else -> Math.abs(a - b) < 0.0001f
+    }
+
+    private fun notifyBacklightAnimFinished(dev: Any, ratio: Float) {
+        val ext = findExt(dev) ?: return
+        try {
+            val m = ext.javaClass.declaredMethods.firstOrNull {
+                it.name == "notifyBacklightAnimFinished" && it.parameterTypes.size == 1 &&
+                    it.parameterTypes[0] == java.lang.Float.TYPE
+            } ?: return
+            m.isAccessible = true
+            m.invoke(ext, ratio)
+        } catch (_: Throwable) {
+        }
     }
 
     /**
@@ -1718,63 +1726,131 @@ object HdrBoostHook {
      * 这里只接管这一个方法，完全不碰亮度通路。
      */
     private fun hookAospRatioBypass(classLoader: ClassLoader): Int = try {
-        val cls = XposedHelpers.findClass(
-            "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice" + D + "1",
-            classLoader
-        )
-        val n = hookAll(cls, "handleHdrSdrNitsChanged", object : XC_MethodHook() {
+        ratioBypassInstalled = false
+        ratioBypassVerified = false
+        val hook = object : XpHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 if (!aospMode || !enabled()) return
                 val nits = param.args.getOrNull(0) as? Float ?: return
                 val sdrNits = param.args.getOrNull(1) as? Float ?: return
-                // AOSP 原版判定
-                val raw = if (nits != -1f && sdrNits != -1f) Math.max(1f, nits / sdrNits) else Float.NaN
-                val ratio = if (raw.isNaN()) 1f else Math.min(raw, ratioCap())
-                val dev = try {
-                    XposedHelpers.getObjectField(param.thisObject, "this" + D + "1")
-                } catch (_: Throwable) {
-                    null
-                } ?: return
-                // 与 AOSP 一致：只有真的变化才写，避免 display-changed 风暴
+                val ratio = if (nits != -1f && sdrNits != -1f && nits.isFinite() &&
+                    sdrNits.isFinite() && sdrNits > 0f
+                ) {
+                    Math.max(1f, nits / sdrNits).takeIf { it.isFinite() } ?: Float.NaN
+                } else {
+                    Float.NaN
+                }
+                val dev = localDeviceOf(param.thisObject) ?: return
+                if (findFieldUp(dev.javaClass, "mCurrentHdrSdrRatio") == null) return
                 val cur = try {
-                    XposedHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
+                    XpHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
                 } catch (_: Throwable) {
                     Float.NaN
                 }
-                if (!cur.isNaN() && Math.abs(cur - ratio) < 0.01f) {
-                    param.result = null   // 值没变，跳过原方法
+                if (ratioEquals(cur, ratio)) {
+                    if (!ratio.isNaN()) ratioBypassVerified = true
+                    updateSpecificMode()
+                    param.result = null
                     return
                 }
+                val root = syncRootOf(dev)
+                if (root == null) {
+                    ratioBypassVerified = false
+                    specificMode = false
+                    logEvery("noroot", 30000L) {
+                        "$TAG: sync root unavailable, letting original handleHdrSdrNitsChanged run"
+                    }
+                    return
+                }
+                notifyBacklightAnimFinished(dev, ratio)
+                var writeOk = false
                 val job = Runnable {
                     try {
-                        XposedHelpers.setFloatField(dev, "mCurrentHdrSdrRatio", ratio)
-                        XposedHelpers.callMethod(dev, "updateDeviceInfoLocked")
+                        XpHelpers.setFloatField(dev, "mCurrentHdrSdrRatio", ratio)
+                        XpHelpers.callMethod(dev, "updateDeviceInfoLocked")
+                        writeOk = true
                     } catch (t: Throwable) {
+                        writeOk = false
                         logEvery("bypasswrite", 10000L) { "$TAG: ratio write failed: " + t }
                     }
                 }
-                // getSyncRoot() 定义在 DisplayAdapter 上（不是 device），
-                // 之前直接对 device 调 -> 一直拿不到 -> 无锁写 -> 与显示线程竞态。
-                val root = syncRootOf(dev)
-                if (root != null) {
-                    synchronized(root) { job.run() }
-                } else {
-                    logEvery("noroot", 30000L) {
-                        "$TAG: sync root unavailable, ratio write WITHOUT lock"
-                    }
-                    job.run()
+                synchronized(root) { job.run() }
+                ratioBypassVerified = writeOk && !ratio.isNaN()
+                if (!writeOk) {
+                    specificMode = false
+                    return
                 }
-                param.result = null       // 跳过带厂商门禁的原方法
+                updateSpecificMode()
+                param.result = null
                 logEvery("bypass", 2000L) {
                     "$TAG: ratio bypass nits=" + f2(nits) + " sdrNits=" + f2(sdrNits) +
                         " -> " + f2(ratio)
                 }
             }
-        })
-        if (n > 0) ratioBypassInstalled = true
+        }
+        var n = 0
+        for (cls in ratioHandlerClasses(classLoader)) {
+            n += hookAll(cls, "handleHdrSdrNitsChanged", hook)
+        }
+        if (n > 0) {
+            ratioBypassInstalled = true
+            Xp.log("$TAG: ratio bypass installed on " + n + " method(s)")
+        } else {
+            logEvery("bypassnone", 60000L) { "$TAG: ratio bypass target missing; GENERIC fallback stays active" }
+        }
         n
     } catch (t: Throwable) {
+        ratioBypassInstalled = false
+        ratioBypassVerified = false
         logEvery("bypasshook", 60000L) { "$TAG: ratio bypass hook failed: " + t.message }
+        0
+    }
+
+    /**
+     * 让应用侧「HDR SDR 调光支持」变成可用状态。
+     *
+     * android.view.Display#isHdrSdrRatioAvailable() 的实现就是
+     *     return !Float.isNaN(mDisplayInfo.hdrSdrRatio);
+     * 而 Display#registerHdrSdrRatioChangedListener() 在不可用时直接 return。也就是说
+     * 只要比值是 NaN，应用既显示「不支持」，也永远不会订阅后续变化 —— 即使我们后来
+     * 真的把比值写成 4.7，应用的界面也停在 1.0。这正是 v1.6.2 删掉 NaN 归一后的回归。
+     *
+     * 做法：在 LocalDisplayDevice 重建 DisplayDeviceInfo 之前归一一次，
+     *   NaN      -> 1.0（AOSP 自己的下界：比值恒 >= 1，1.0 就是「HDR 与 SDR 同亮度」）
+     *   有限值   -> 原样保留（HDR 期间由 hookAospRatioBypass / forceHdrSdrRatio 写入真实比值）
+     * 只改这一个字段，不碰亮度通路，也不写 mSupportUltraHDR / mForceSurfaceControl。
+     */
+    private fun hookRatioAvailability(classLoader: ClassLoader): Int = try {
+        var n = 0
+        val hook = object : XpHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                if (!enabled()) return
+                try {
+                    val dev = param.thisObject ?: return
+                    if (findFieldUp(dev.javaClass, "mCurrentHdrSdrRatio") == null) return
+                    val cur = XpHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
+                    if (!cur.isNaN()) return
+                    XpHelpers.setFloatField(dev, "mCurrentHdrSdrRatio", 1.0f)
+                    logEvery("ratioavail", 60000L) {
+                        "$TAG: ratio availability advertised (NaN -> 1.0) so apps can subscribe"
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        val cand = localDisplayCandidates(classLoader)
+        for (cls in cand) {
+            n += hookAll(cls, "updateDeviceInfoLocked", hook)
+        }
+        Xp.log(
+            "$TAG: ratio availability candidates=" + cand.size +
+                " withUpdateDeviceInfo=" + cand.count { hasMethod(it, "updateDeviceInfoLocked") } +
+                " hooked=" + n
+        )
+        if (n > 0) Xp.log("$TAG: ratio availability hook installed on " + n + " method(s)")
+        n
+    } catch (t: Throwable) {
+        logEvery("ratioavailhook", 60000L) { "$TAG: ratio availability hook failed: " + t.message }
         0
     }
 
@@ -1783,36 +1859,42 @@ object HdrBoostHook {
      * 不改任何行为，纯粹为了「比值为什么是 1」能一眼看出来。
      */
     private fun hookRatioProbeOnly(classLoader: ClassLoader): Int = try {
-        val cls = XposedHelpers.findClass(
-            "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice" + D + "1",
-            classLoader
-        )
-        hookAll(cls, "handleHdrSdrNitsChanged", object : XC_MethodHook() {
+        val hook = object : XpHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
+                if (!enabled()) return
                 logEvery("probeOnly", 2000L) {
                     val nits = param.args.getOrNull(0) as? Float ?: Float.NaN
                     val sdrNits = param.args.getOrNull(1) as? Float ?: Float.NaN
+                    val dev = localDeviceOf(param.thisObject)
                     var gates = "?"
-                    try {
-                        val dev = XposedHelpers.getObjectField(param.thisObject, "this" + D + "1")
-                        val ba = XposedHelpers.getObjectField(dev, "mBacklightAdapter")
-                        val adapter = XposedHelpers.getObjectField(dev, "this" + D + "0")
-                        gates = "use=" + XposedHelpers.getBooleanField(ba, "mUseSurfaceControlBrightness") +
-                            " force=" + XposedHelpers.getBooleanField(ba, "mForceSurfaceControl") +
-                            " ultra=" + XposedHelpers.getBooleanField(adapter, "mSupportUltraHDR")
-                    } catch (_: Throwable) {
-                    }
-                    val cur = try {
-                        val dev = XposedHelpers.getObjectField(param.thisObject, "this" + D + "1")
-                        XposedHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
-                    } catch (_: Throwable) {
-                        Float.NaN
+                    var cur = Float.NaN
+                    if (dev != null) {
+                        try {
+                            val ba = XpHelpers.getObjectField(dev, "mBacklightAdapter")
+                            val adapter = adapterOf(dev)
+                            gates = "use=" + XpHelpers.getBooleanField(ba, "mUseSurfaceControlBrightness") +
+                                " force=" + XpHelpers.getBooleanField(ba, "mForceSurfaceControl") +
+                                " ultra=" + (adapter?.let {
+                                    XpHelpers.getBooleanField(it, "mSupportUltraHDR").toString()
+                                } ?: "?")
+                        } catch (_: Throwable) {
+                        }
+                        cur = try {
+                            XpHelpers.getFloatField(dev, "mCurrentHdrSdrRatio")
+                        } catch (_: Throwable) {
+                            Float.NaN
+                        }
                     }
                     "$TAG: PROBE handleHdrSdrNitsChanged(nits=" + f2(nits) +
                         " sdrNits=" + f2(sdrNits) + ") -> current=" + f2(cur) + " [" + gates + "]"
                 }
             }
-        })
+        }
+        var n = 0
+        for (cls in ratioHandlerClasses(classLoader)) {
+            n += hookAll(cls, "handleHdrSdrNitsChanged", hook)
+        }
+        n
     } catch (t: Throwable) {
         logEvery("probefail", 60000L) { "$TAG: ratio probe hook failed: " + t.message }
         0
@@ -1831,72 +1913,79 @@ object HdrBoostHook {
         return null
     }
 
+    private data class SplineTarget(
+        val field: java.lang.reflect.Field,
+        val owner: Any,
+        val shape: String
+    )
+
+    private fun resolveSplineTarget(cfg: Any): SplineTarget? {
+        findFieldUp(cfg.javaClass, "mSdrToHdrRatioSpline")?.let {
+            it.isAccessible = true
+            return SplineTarget(it, cfg, "DisplayDeviceConfig.mSdrToHdrRatioSpline")
+        }
+        for (holderName in arrayOf("mHbmData", "mHdrBrightnessData")) {
+            val holderField = findFieldUp(cfg.javaClass, holderName) ?: continue
+            holderField.isAccessible = true
+            val holder = holderField.get(cfg) ?: continue
+            val splineField = findFieldUp(holder.javaClass, "sdrToHdrRatioSpline") ?: continue
+            splineField.isAccessible = true
+            return SplineTarget(splineField, holder, holderName + ".sdrToHdrRatioSpline")
+        }
+        return null
+    }
+
     private fun installSpecificSpline() {
-        if (splineInstalled) return
+        if (!aospMode || !enabled() || splineInstalled) return
         val cfg = displayConfig ?: run {
-            XposedBridge.log("$TAG: spline install deferred: displayConfig not captured yet")
+            logEvery("splinedefer", 60000L) { "$TAG: spline install deferred: displayConfig not captured yet" }
             return
         }
-        // 不再要求「面板 nits 曲线先解析成功」才安装曲线：
-        // 插值是惰性求值的（splineRatio 内部会自行解析，解析不出时退回 cap），
-        // 所以这里只要字段存在就装。否则一旦解析失败，整条链路会静默失效。
+        val target = resolveSplineTarget(cfg) ?: run {
+            logEvery("splineshape", 60000L) {
+                "$TAG: spline install deferred: no supported sdrToHdrRatioSpline field on " + cfg.javaClass.name
+            }
+            return
+        }
+        if (!resolveCfgMethods() || !panelMinNits.isFinite() || !panelMaxNits.isFinite() ||
+            panelMaxNits <= panelMinNits
+        ) {
+            logEvery("splinenits", 60000L) {
+                "$TAG: spline install deferred: panel nits unresolved (max=" +
+                    f2(panelMaxNits) + "), will retry"
+            }
+            return
+        }
         try {
-            val fld = findFieldUp(cfg.javaClass, "mSdrToHdrRatioSpline") ?: run {
-                XposedBridge.log(
-                    "$TAG: spline install FAILED: field mSdrToHdrRatioSpline not found on " +
-                        cfg.javaClass.name
-                )
-                return
-            }
-            fld.isAccessible = true
-            val splineCls = fld.type
-            // ★ android.util.Spline 是**抽象类**，不是接口，所以不能用 Proxy。
-            //   正确做法是用 AOSP 自己的静态工厂造一条真曲线 —— 这正是
-            //   DisplayDeviceConfig 解析 display_id_*.xml 里 <sdrHdrRatioMap> 时做的事，
-            //   等价于旧模块改配置文件。
-            if (!resolveCfgMethods()) {
-                XposedBridge.log(
-                    "$TAG: spline install deferred: panel nits unresolved (max=" +
-                        f2(panelMaxNits) + "), will retry"
-                )
-                return
-            }
+            val splineCls = target.field.type
             val cap = ratioCap()
             val xs = floatArrayOf(panelMinNits, panelMaxNits)
-            val ys = floatArrayOf(cap, 1.0f)   // 低亮度 -> cap，面板最大亮度 -> 1.0
+            val ys = floatArrayOf(cap, 1.0f)
             val spline = buildSpline(splineCls, xs, ys) ?: run {
-                XposedBridge.log(
-                    "$TAG: spline install FAILED: no static factory on " + splineCls.name
-                )
+                logEvery("splinefactory", 60000L) {
+                    "$TAG: spline install deferred: no static factory on " + splineCls.name
+                }
                 return
             }
-            fld.set(cfg, spline)
+            target.field.set(target.owner, spline)
             splineProxy = spline
+            splineField = target.field
+            splineOwner = target.owner
+            splineShape = target.shape
             splineInstalled = true
-            XposedBridge.log(
-                "$TAG: specific chain ① sdrHdrRatioSpline replaced (" + splineCls.simpleName +
-                    " x=[" + f2(xs[0]) + "," + f2(xs[1]) + "] y=[" + f2(ys[0]) + "," + f2(ys[1]) + "])"
+            Xp.log(
+                "$TAG: specific chain sdrHdrRatioSpline replaced (" + target.shape +
+                    " " + splineCls.simpleName + " x=[" + f2(xs[0]) + "," + f2(xs[1]) +
+                    "] y=[" + f2(ys[0]) + "," + f2(ys[1]) + "])"
             )
         } catch (t: Throwable) {
             logEvery("splinefail", 60000L) { "$TAG: replace sdrHdrRatioSpline failed: " + t }
         }
     }
 
-    @Volatile private var forceSurfaceControlSet = false
-    @Volatile private var localDisplayAdapter: Any? = null
-
-    /**
-     * 是否「只走专项链路」—— 启动时一次性判定，判定成功后**根本不安装任何补偿钩子**。
-     *
-     * 这是对「旧模块为什么没问题」的直接回答：旧模块是改磁盘上的系统，
-     * 改完之后系统里没有补偿逻辑，自然不会打架。我们等价的做法就是：
-     * 只要能开出门禁，就完全不挂 setDisplayBrightness / requestDisplayStateLocked /
-     * HBM 强制 / 状态机 watcher —— 挂不上的钩子永远不会有多余行为。
-     */
-    @Volatile private var specificOnlyChain = false
     @Volatile private var ratioBypassInstalled = false
-
-    private fun hasField(c: Class<*>, name: String): Boolean = findFieldUp(c, name) != null
+    /** 只有一次真正按 AOSP 语义写出过有限比值，专项链路才算健康。 */
+    @Volatile private var ratioBypassVerified = false
 
     /** 沿继承链找字段：厂商常常把 DisplayDeviceConfig 再派生一层，字段在父类上，
      *  只用 getDeclaredField 会直接 NoSuchFieldException。 */
@@ -1914,140 +2003,131 @@ object HdrBoostHook {
         return null
     }
 
-    private fun hasMethod(c: Class<*>, name: String, vararg p: Class<*>): Boolean = try {
-        c.getDeclaredMethod(name, *p)
-        true
-    } catch (_: Throwable) {
-        false
-    }
-
-    private fun specificChainPossible(cl: ClassLoader): Boolean = try {
-        val inner = XposedHelpers.findClass(
-            "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice" + D + "1", cl
-        )
-        val cfg = XposedHelpers.findClass("com.android.server.display.DisplayDeviceConfig", cl)
-        // 只要「能替换曲线」且「能接管比值计算」就够。
-        // 不再依赖 mSupportUltraHDR / mForceSurfaceControl —— 改那些标志会切亮度通路，
-        // 本机不支持 SurfaceControl 亮度，置 true 会导致屏幕点不亮。
-        val ok = hasField(cfg, "mSdrToHdrRatioSpline") &&
-            hasMethod(inner, "handleHdrSdrNitsChanged", java.lang.Float.TYPE, java.lang.Float.TYPE)
-        XposedBridge.log(
-            "$TAG: specific-chain probe -> " + ok +
-                " [mSdrToHdrRatioSpline=" + hasField(cfg, "mSdrToHdrRatioSpline") +
-                " handleHdrSdrNitsChanged=" +
-                hasMethod(inner, "handleHdrSdrNitsChanged", java.lang.Float.TYPE, java.lang.Float.TYPE) +
-                "]"
-        )
-        ok
-    } catch (t: Throwable) {
-        logEvery("specprobe", 60000L) { "$TAG: specific-chain probe failed: " + t.message }
-        false
-    }
-
-    /**
-     * ①' 把 mForceSurfaceControl 置 true —— 这是「与 AOSP 对齐」的关键一步。
-     *
-     * 设备里的 LocalDisplayDevice 构造函数：
-     *     mBacklightAdapter.setForceSurfaceControl(
-     *             mDisplayDeviceConfig.hasQuirk("canSetBrightnessViaHwc"));
-     * 本机该 quirk 为 false，加上 mUseSurfaceControlBrightness 也是 false，
-     * 于是厂商在 handleHdrSdrNitsChanged 里加的
-     *     if (!(use || force)) goto NaN;
-     * 永远成立 -> 比值恒 NaN。
-     *
-     * 而 AOSP android15 的 setDisplayBrightness 只有一道门：
-     *     if (getDisplayDeviceConfig().hasSdrToHdrRatioSpline()) handleHdrSdrNitsChanged(...)
-     * 根本没有 use/force/mSupportUltraHDR 这些条件。
-     * 所以把这两个标志置位后，设备行为就与 AOSP 完全一致，比值由系统自己算。
-     */
-    private fun hookForceSurfaceControl(classLoader: ClassLoader): Int = try {
-        val cls = XposedHelpers.findClass(
-            "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice", classLoader
-        )
-        // ★ 直接拦截 setter 本身：无论谁调用、调多少次、传什么，一律强制成 true。
-        //   只 hook 构造函数再补一次是不够的 —— 实测运行时读回来仍是 false
-        //   （PROBE ... [use=false force=false ultra=true]），说明补写没作用到活着的实例。
-        var n = 0
-        try {
-            val baCls = XposedHelpers.findClass(
-                "com.android.server.display.LocalDisplayAdapter" + D + "BacklightAdapter", classLoader
-            )
-            n += XposedBridge.hookAllMethods(baCls, "setForceSurfaceControl",
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (param.args.isNotEmpty()) param.args[0] = true
-                        forceSurfaceControlSet = true
-                        logEvery("forceSet", 60000L) {
-                            "$TAG: AOSP-align ①' setForceSurfaceControl -> true (vendor gate opened)"
-                        }
-                    }
-                }).size
-            // ★ 关键：setForceSurfaceControl 只在 loadDisplayDeviceConfig() 里被调用，
-            //   而 BacklightAdapter 构造函数会把 mForceSurfaceControl 初始化为 false。
-            //   只要适配器被重建过一次，之前那次补写就丢了（实测 PROBE 一直是 force=false）。
-            //   所以直接 hook 构造函数，保证任何实例创建完就是 true。
-            n += XposedBridge.hookAllConstructors(baCls, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    try {
-                        XposedHelpers.setBooleanField(param.thisObject, "mForceSurfaceControl", true)
-                        forceSurfaceControlSet = true
-                        logEvery("forceCtor", 60000L) {
-                            "$TAG: AOSP-align ①' BacklightAdapter ctor -> mForceSurfaceControl=true"
-                        }
-                    } catch (t: Throwable) {
-                        logEvery("forceCtorFail", 60000L) {
-                            "$TAG: force flag write failed: " + t
-                        }
-                    }
-                }
-            }).size
-        } catch (t: Throwable) {
-            logEvery("forcehook2", 60000L) { "$TAG: BacklightAdapter hook failed: " + t.message }
+    private fun hasMethod(c: Class<*>, name: String, vararg p: Class<*>): Boolean {
+        var k: Class<*>? = c
+        while (k != null) {
+            try {
+                k.getDeclaredMethod(name, *p)
+                return true
+            } catch (_: Throwable) {
+                k = k.superclass
+            }
         }
-        // 构造函数里再补一次（双保险）
-        n += XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                try {
-                    val ba = XposedHelpers.getObjectField(param.thisObject, "mBacklightAdapter")
-                    try {
-                        localDisplayAdapter = XposedHelpers.getObjectField(param.thisObject, "this" + D + "0")
-                    } catch (_: Throwable) {
-                    }
-                    XposedHelpers.callMethod(ba, "setForceSurfaceControl", true)
-                    forceSurfaceControlSet = true
-                } catch (t: Throwable) {
-                    logEvery("forcefail", 60000L) {
-                        "$TAG: setForceSurfaceControl(true) failed: " + t
-                    }
-                }
-            }
-        }).size
-        n
-    } catch (t: Throwable) {
-        logEvery("forcehook", 60000L) { "$TAG: LocalDisplayDevice ctor hook failed: " + t.message }
-        0
+        return false
     }
 
-    /** ② 放开 mSupportUltraHDR（等效旧模块删掉那个与条件） */
-    private fun hookLocalDisplayAdapterForSpecific(classLoader: ClassLoader): Boolean = try {
-        val cls = XposedHelpers.findClass("com.android.server.display.LocalDisplayAdapter", classLoader)
-        XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                try {
-                    XposedHelpers.setBooleanField(param.thisObject, "mSupportUltraHDR", true)
-                    ultraHdrForced = true
-                    XposedBridge.log("$TAG: specific chain ② mSupportUltraHDR forced true")
-                } catch (_: Throwable) {
-                }
+    private fun hasMethodAny(c: Class<*>, name: String): Boolean {
+        var k: Class<*>? = c
+        while (k != null) {
+            if (k.declaredMethods.any { it.name == name }) return true
+            k = k.superclass
+        }
+        return false
+    }
+
+    private fun floatUnary(owner: Any, names: Array<String>): Pair<java.lang.reflect.Method, Any>? {
+        var k: Class<*>? = owner.javaClass
+        while (k != null) {
+            for (m in k.declaredMethods) {
+                if (m.name !in names) continue
+                if (m.parameterTypes.size != 1 || m.parameterTypes[0] != java.lang.Float.TYPE) continue
+                if (m.returnType != java.lang.Float.TYPE) continue
+                if (java.lang.reflect.Modifier.isStatic(m.modifiers)) continue
+                m.isAccessible = true
+                return Pair(m, owner)
             }
-        })
-        true
-    } catch (t: Throwable) {
-        logEvery("uhdrfail", 60000L) { "$TAG: LocalDisplayAdapter hook failed: " + t.message }
-        false
+            k = k.superclass
+        }
+        return null
+    }
+
+    /** LocalDisplayDevice 本体 + 它内部的 listener 类（$1..$16），不过滤方法，供多用途复用。 */
+    private fun localDisplayCandidates(cl: ClassLoader): List<Class<*>> {
+        val out = ArrayList<Class<*>>()
+        val device = try {
+            XpHelpers.findClass("com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice", cl)
+        } catch (_: Throwable) {
+            null
+        }
+        if (device != null) {
+            out.add(device)
+            try {
+                out.addAll(device.declaredClasses.toList())
+            } catch (_: Throwable) {
+            }
+        }
+        for (i in 1..16) {
+            try {
+                out.add(
+                    XpHelpers.findClass(
+                        "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice" + D + i, cl
+                    )
+                )
+            } catch (_: Throwable) {
+            }
+        }
+        return out.distinct()
+    }
+
+    private fun ratioHandlerClasses(cl: ClassLoader): List<Class<*>> {
+        val out = ArrayList<Class<*>>()
+        val device = try {
+            XpHelpers.findClass("com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice", cl)
+        } catch (_: Throwable) {
+            null
+        }
+        if (device != null) {
+            out.add(device)
+            try {
+                out.addAll(device.declaredClasses.toList())
+            } catch (_: Throwable) {
+            }
+        }
+        for (i in 1..16) {
+            try {
+                out.add(
+                    XpHelpers.findClass(
+                        "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice" + D + i, cl
+                    )
+                )
+            } catch (_: Throwable) {
+            }
+        }
+        val F = java.lang.Float.TYPE
+        return out.distinct().filter { hasMethod(it, "handleHdrSdrNitsChanged", F, F) }
+    }
+
+    private fun brightnessCandidates(cl: ClassLoader): List<Class<*>> {
+        val out = ArrayList<Class<*>>()
+        val device = try {
+            XpHelpers.findClass("com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice", cl)
+        } catch (_: Throwable) {
+            null
+        }
+        if (device != null) {
+            out.add(device)
+            try {
+                out.addAll(device.declaredClasses.toList())
+            } catch (_: Throwable) {
+            }
+        }
+        for (i in 1..16) {
+            try {
+                out.add(
+                    XpHelpers.findClass(
+                        "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice" + D + i, cl
+                    )
+                )
+            } catch (_: Throwable) {
+            }
+        }
+        return out.distinct().filter { hasMethodAny(it, "setDisplayBrightness") }
     }
 
     @Volatile private var splineProxy: Any? = null
+    @Volatile private var splineField: java.lang.reflect.Field? = null
+    @Volatile private var splineOwner: Any? = null
+    @Volatile private var splineShape = "none"
     @Volatile private var lastModeCheckAt = 0L
 
     /** 本次 HDR 会话内专项链路没生效 -> 临时退回通用兜底 */
@@ -2056,82 +2136,58 @@ object HdrBoostHook {
 
     private fun updateSpecificMode() {
         // 曲线已替换 + 比值计算已被接管 = 设备行为回到 AOSP
-        specificMode = splineInstalled && ratioBypassInstalled
+        specificMode = aospMode && splineInstalled && ratioBypassInstalled && ratioBypassVerified
     }
 
-    @Volatile private var wdCache = false
-    @Volatile private var wdAt = 0L
-
-    /** 门禁守护开关（Settings.System:hdr_gate_watchdog，默认 false） */
-    private fun gateWatchdogEnabled(): Boolean {
-        val now = android.os.SystemClock.elapsedRealtime()
-        if (now - wdAt < 5000L) return wdCache
-        val v = try {
-            io.github.fkhdr.Config.getGateWatchdog()
-        } catch (_: Throwable) {
-            false
-        }
-        wdCache = v
-        wdAt = now
-        return v
-    }
-
-    /** 周期性把厂商加的两道门禁重新置 true（等效于旧模块「反编译删掉那三个判断」） */
-    private fun reassertVendorGates() {
-        try {
-            val adapter = localDisplayAdapter
-            if (adapter != null) {
-                XposedHelpers.setBooleanField(adapter, "mSupportUltraHDR", true)
-            }
-        } catch (_: Throwable) {
-        }
-        try {
-            val dev = aospDev
-            if (dev != null) {
-                val ba = XposedHelpers.getObjectField(dev, "mBacklightAdapter")
-                XposedHelpers.callMethod(ba, "setForceSurfaceControl", true)
-            }
-        } catch (_: Throwable) {
-        }
-    }
+    // 门禁守护已删除：绝不写 mSupportUltraHDR / mForceSurfaceControl，避免切到设备不支持的亮度通路。
 
     /** 当前是否真的按「专项链路（系统自算）」运行 */
-    private fun specOn(): Boolean = specificOnlyChain || (specificMode && !specFallback)
+    private fun specOn(): Boolean = aospMode && specificMode && !specFallback
 
     /**
-     * 周期性自检，解决两个「永久卡死」：
-     *  ① DPC 早于 LocalDisplayAdapter 构造 -> updateSpecificMode 只算一次会永久 GENERIC
-     *  ② DisplayDeviceConfig 重新加载把 spline 换回原厂对象 -> 永久 SPECIFIC 但完全不提亮
+     * 周期性自检，防止链路长期卡在错误状态：
+     *  ① DPC 早于 LocalDisplayAdapter 构造时，持续重试安装 spline；
+     *  ② 系统重新加载 DisplayDeviceConfig 时，检测曲线被换回并重装；
+     *  ③ 专项链长时间不能产生有效比值时，退回始终安装的 GENERIC 兜底。
      */
     private fun refreshSpecificMode() {
+        if (!aospMode || !enabled()) {
+            specificMode = false
+            return
+        }
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastModeCheckAt < 3000L) return
         lastModeCheckAt = now
-        if (!ultraHdrForced) updateSpecificMode()
-        // 门禁守护是**可选**的：正常情况下开机时在构造函数里置位一次就够了。
-        // 只有 ROM 会在运行中重置 mSupportUltraHDR / mForceSurfaceControl 时才需要打开
-        // （App 里的「门禁守护」开关，默认关闭）。
-        if (gateWatchdogEnabled()) reassertVendorGates()
-        val cfg = displayConfig
-        if (cfg != null && splineInstalled) {
+        val before = specificMode
+        if (!splineInstalled) {
+            installSpecificSpline()
+        } else {
+            val fld = splineField
+            val owner = splineOwner
+            val proxy = splineProxy
             try {
-                val fld = findFieldUp(cfg.javaClass, "mSdrToHdrRatioSpline")
-                if (fld != null && fld.get(cfg) !== splineProxy) {
+                if (fld == null || owner == null || proxy == null || fld.get(owner) !== proxy) {
                     splineInstalled = false
-                    XposedBridge.log("$TAG: sdrHdrRatioSpline was replaced by system -> reinstall")
+                    splineProxy = null
+                    logEvery("splinecheck", 60000L) {
+                        "$TAG: sdrHdrRatioSpline was replaced or invalid -> reinstall"
+                    }
                     installSpecificSpline()
                 }
             } catch (t: Throwable) {
+                splineInstalled = false
+                splineProxy = null
                 logEvery("splinecheck", 60000L) { "$TAG: spline check failed: " + t }
+                installSpecificSpline()
             }
         }
-        val before = specificMode
         updateSpecificMode()
         if (before != specificMode) {
-            XposedBridge.log(
+            Xp.log(
                 "$TAG: chain -> " + (if (specificMode) "SPECIFIC(系统自算)" else "GENERIC(模块代劳)") +
-                    " [spline=" + splineInstalled + " ultraHdr=" + ultraHdrForced +
-                    " force=" + forceSurfaceControlSet + "]"
+                    " [spline=" + splineInstalled + " shape=" + splineShape +
+                    " bypass=" + ratioBypassInstalled + " verified=" + ratioBypassVerified +
+                    " fallback=" + specFallback + "]"
             )
         }
     }
@@ -2155,10 +2211,10 @@ object HdrBoostHook {
     private fun hbmEnabled(): Boolean = prop2(PROP_HBM, PROP_HBM_OLD, "1") != "0"
 
     private fun hookHighBrightnessModeController(classLoader: ClassLoader): Boolean = try {
-        val cls = XposedHelpers.findClass(
+        val cls = XpHelpers.findClass(
             "com.android.server.display.HighBrightnessModeController", classLoader
         )
-        XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
+        Xp.hookAllConstructors(cls, object : XpHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 hbmCtl = param.thisObject
                 logEvery("hbmctl", 60000L) { "$TAG: HBM controller captured" }
@@ -2180,17 +2236,17 @@ object HdrBoostHook {
             return
         }
         try {
-            XposedHelpers.setBooleanField(c, "mIsHdrLayerPresent", boost)
+            XpHelpers.setBooleanField(c, "mIsHdrLayerPresent", boost)
             try {
                 // 目标 HDR/SDR 比：决定 getHdrBrightnessValue() 的 headroom
-                XposedHelpers.setFloatField(
+                XpHelpers.setFloatField(
                     c, "mMaxDesiredHdrSdrRatio", if (boost) factor().coerceIn(1f, 20f) else 1f
                 )
             } catch (_: Throwable) {
             }
-            XposedHelpers.callMethod(c, "updateHbmMode")
+            XpHelpers.callMethod(c, "updateHbmMode")
             val mode = try {
-                XposedHelpers.getIntField(c, "mHbmMode")
+                XpHelpers.getIntField(c, "mHbmMode")
             } catch (_: Throwable) {
                 -1
             }
@@ -2202,57 +2258,19 @@ object HdrBoostHook {
         }
     }
 
-    /**
-     * AOSP 真正的 HDR 比值闸门。
-     *
-     * AOSP 16 LocalDisplayAdapter$LocalDisplayDevice$1#setDisplayBrightness 里只有这一句：
-     *     if (getDisplayDeviceConfig().hasSdrToHdrRatioSpline()) handleHdrSdrNitsChanged(nits, sdrNits);
-     * 面板 XML 没声明 sdr-to-hdr-ratio-spline 时该方法返回 false → 比值永不计算。
-     * 本机实测 hasSdrToHdrRatioSpline=false，所以类原生上比值恒为初始 NaN。
-     *
-     * 直接放行即可：handleHdrSdrNitsChanged 自己会用 backlightToNits 算 nits/sdrNits，
-     * HDR 关时 brightness == sdrBrightness → 比值自然回到 1.0，不需要我们再收拾。
-     *
-     * 注意：OPPO 的 isSupportSdrToHdrRatio() 是另一套（仅 ColorOS 存在），两者都要挂。
-     */
-    /** 闸门开放窗口：HDR 关闭后再保留 5s，用于让回落那一次也把比值算回 1.0 */
+
+    /** 闸门开放窗口：HDR 关闭后再保留 5s，用于把残留的有限旧比值恢复为 1.0；NaN 保持「不可用」 */
     @Volatile private var gateUntil = 0L
     /** HDR 内容首次消失的时刻（用于退出迟滞） */
     @Volatile private var hdrOffSince = 0L
 
-    private fun hookAospRatioGate(classLoader: ClassLoader): Int = try {
-        val cls = XposedHelpers.findClass("com.android.server.display.DisplayDeviceConfig", classLoader)
-        val n = XposedBridge.hookAllMethods(cls, "hasSdrToHdrRatioSpline", object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                if (!enabled()) return
-                // 只在 HDR 期间放行。常开会让「比值算不出（NaN）」的机型每次亮度变化都触发
-                // updateDeviceInfoLocked（floatEquals(NaN,NaN) 恒 false），白烧性能。
-                if (hdrOn || android.os.SystemClock.elapsedRealtime() < gateUntil) {
-                    param.result = true
-                }
-            }
-        }).size
-        if (n > 0) {
-            XposedBridge.log("$TAG: aosp ratio gate opened on DisplayDeviceConfig.hasSdrToHdrRatioSpline (" + n + " method)")
-        } else {
-            XposedBridge.log("$TAG: aosp ratio gate MISSING: hasSdrToHdrRatioSpline not found")
-        }
-        n
-    } catch (t: Throwable) {
-        XposedBridge.log("$TAG: aosp ratio gate failed: " + t.message)
-        0
-    }
-
     /**
-     * 比值诊断探针：证明 handleHdrSdrNitsChanged 到底有没有被调用、算出来的比值是多少。
-     * 这是类原生上「到底卡在哪一环」的最终判据：
-     *   没有这行 → 闸门没开（hasSdrToHdrRatioSpline 没挂上）
-     *   有这行但 nits==sdrNits → 亮度没推上去
+     * 只读比值诊断探针：打印 handleHdrSdrNitsChanged 的真实入参与算出的比值。
+     * 判据：没有这行 → 系统没调用该方法或比值链未就绪；nits==sdrNits → 亮度没推上去。
+     * 当前不再挂 hasSdrToHdrRatioSpline()，也不写任何厂商门禁标志位。
      */
-    @Volatile private var probeInstalled = false
-
     private fun hookHdrRatioProbe(inner: Class<*>): Int = try {
-        val n = XposedBridge.hookAllMethods(inner, "handleHdrSdrNitsChanged", object : XC_MethodHook() {
+        val n = Xp.hookAllMethods(inner, "handleHdrSdrNitsChanged", object : XpHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 if (!enabled()) return
                 val nits = param.args.getOrNull(0) as? Float ?: return
@@ -2263,62 +2281,20 @@ object HdrBoostHook {
                 }
             }
         }).size
-        if (n > 0) probeInstalled = true
         n
     } catch (t: Throwable) {
         logEvery("probe", 60000L) { "$TAG: ratio probe unavailable: " + t.message }
         0
     }
 
-    /**
-     * 让 hdrSdrRatio 永不等于 NaN（无 HDR 内容时报 1.0）。
-     *
-     * 为什么必须这么做：android.view.Display#isHdrSdrRatioAvailable() 的实现就是
-     *     return !Float.isNaN(mDisplayInfo.hdrSdrRatio);
-     * 而应用（含 HDR 能力检测 App）只有在它返回 true 时才会
-     *     display.registerHdrSdrRatioChangedListener(...)
-     * 去订阅后续变化。本机原厂路径因为 backlight adapter 不支持 SurfaceControl 亮度，
-     * handleHdrSdrNitsChanged 会把比值写成 NaN —— 于是「HDR SDR 调光支持」永远 ❌、
-     * App 永远不订阅、界面永远停在 1.0（即使我们后面真的把比值改成了 60）。
-     *
-     * 这里在每次重建 DisplayDeviceInfo 之前把 NaN 归一成 1.0：
-     *   无 HDR -> 报 1.0（支持=✔️，App 会订阅）
-     *   有 HDR -> 我们的 forceHdrSdrRatio 写入真实比值，App 通过监听器实时看到
-     */
-    private fun hookRatioNeverNaN(classLoader: ClassLoader): Int = try {
-        val cls = XposedHelpers.findClass(
-            "com.android.server.display.LocalDisplayAdapter" + D + "LocalDisplayDevice", classLoader
-        )
-        // ① updateDeviceInfoLocked(before)：把字段本身归一，后续 mInfo 拷贝自然是 1.0
-        hookAll(cls, "updateDeviceInfoLocked", object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                try {
-                    val r = XposedHelpers.getFloatField(param.thisObject, "mCurrentHdrSdrRatio")
-                    if (r.isNaN()) {
-                        sysRatioNaNSince = android.os.SystemClock.elapsedRealtime()
-                        XposedHelpers.setFloatField(param.thisObject, "mCurrentHdrSdrRatio", 1.0f)
-                    }
-                } catch (_: Throwable) {
-                }
-            }
-        })
-        // ② 原先还挂了 getDisplayDeviceInfoLocked(after) 做 NaN 归一。
-        //    但它在 system_server 崩溃栈里出现过：
-        //      ArrayIndexOutOfBoundsException at getDisplayDeviceInfoLocked(LocalDisplayAdapter.java:725)
-        //      at ...CaimpCramng.getDisplayDeviceInfoLocked  ← 我们的钩子
-        //      at DisplayDeviceRepository.handleDisplayDeviceChanged
-        //    现在比值由 hookAospRatioBypass 在每次 setDisplayBrightness 时写入，
-        //    mCurrentHdrSdrRatio 不再是 NaN，这个钩子已无必要，移除以消除崩溃面。
-    } catch (t: Throwable) {
-        logEvery("nanfix", 60000L) { "$TAG: ratio-never-NaN hook failed: " + t.message }
-        0
-    }
+    // AOSP Display.isHdrSdrRatioAvailable() 用 !Float.isNaN(hdrSdrRatio) 判可用；
+    // NaN 是合法的「不可用」状态，绝不伪装成 1.0。
 
     /** 在 LocalDisplayDevice 上找到 ext 实现对象（字段名/类型名两种策略） */
     private fun findExt(devObj: Any): Any? {
         for (name in arrayOf("mLocalDisplayDeviceExt", "mLocalDisplayDeviceExtImpl")) {
             try {
-                val v = XposedHelpers.getObjectField(devObj, name)
+                val v = XpHelpers.getObjectField(devObj, name)
                 if (v != null) return v
             } catch (_: Throwable) {
             }
@@ -2346,14 +2322,11 @@ object HdrBoostHook {
     // 播放状态与包名；只要「前台应用正在播放媒体」就视为 HDR 场景，交给同一套提亮链。
     private val playingPkgs = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
-    /** 拥有媒体会话的应用（不限播放状态）。系统视频播放器就是靠这条能被识别到。 */
-    private val sessionPkgs = java.util.concurrent.ConcurrentHashMap<String, Long>()
-
     private fun videoEnabled(): Boolean = prop2(PROP_VIDEO, PROP_VIDEO_OLD, "1") != "0"
 
     private fun hookMediaSessions(classLoader: ClassLoader): Int = try {
-        val cls = XposedHelpers.findClass("com.android.server.media.MediaSessionStack", classLoader)
-        val hook = object : XC_MethodHook() {
+        val cls = XpHelpers.findClass("com.android.server.media.MediaSessionStack", classLoader)
+        val hook = object : XpHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 if (!enabled() || !videoEnabled()) return
                 val rec = param.args.getOrNull(0) ?: return
@@ -2361,25 +2334,24 @@ object HdrBoostHook {
             }
         }
         var n = hookAll(cls, "onPlaybackStateChanged", hook)
-        n += hookAll(cls, "addSession", object : XC_MethodHook() {
+        n += hookAll(cls, "addSession", object : XpHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 recheckNow()
                 if (!enabled() || !videoEnabled()) return
                 noteSession(param.args.getOrNull(0) ?: return)
             }
         })
-        n += hookAll(cls, "removeSession", object : XC_MethodHook() {
+        n += hookAll(cls, "removeSession", object : XpHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val rec = param.args.getOrNull(0) ?: return
                 try {
-                    val pkg = XposedHelpers.callMethod(rec, "getPackageName") as? String ?: return
+                    val pkg = XpHelpers.callMethod(rec, "getPackageName") as? String ?: return
                     playingPkgs.remove(pkg)
-                    sessionPkgs.remove(pkg)
                 } catch (_: Throwable) {
                 }
             }
         })
-        n += hookAll(cls, "joinSession2Stack", object : XC_MethodHook() {
+        n += hookAll(cls, "joinSession2Stack", object : XpHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 if (!enabled() || !videoEnabled()) return
                 noteSession(param.args.getOrNull(0) ?: return)
@@ -2387,21 +2359,20 @@ object HdrBoostHook {
         })
         n
     } catch (t: Throwable) {
-        XposedBridge.log("$TAG: MediaSessionStack not found: " + t.message)
+        Xp.log("$TAG: MediaSessionStack not found: " + t.message)
         0
     }
 
     private fun noteSession(rec: Any) {
         try {
-            val pkg = XposedHelpers.callMethod(rec, "getPackageName") as? String ?: return
-            sessionPkgs[pkg] = android.os.SystemClock.elapsedRealtime()
+            val pkg = XpHelpers.callMethod(rec, "getPackageName") as? String ?: return
             var state = -1
             try {
-                state = XposedHelpers.getIntField(rec, "mPlaybackState")
+                state = XpHelpers.getIntField(rec, "mPlaybackState")
             } catch (_: Throwable) {
                 try {
-                    val st = XposedHelpers.callMethod(rec, "getStateWithUpdatedPosition") ?: return
-                    state = XposedHelpers.callMethod(st, "getState") as? Int ?: -1
+                    val st = XpHelpers.callMethod(rec, "getStateWithUpdatedPosition") ?: return
+                    state = XpHelpers.callMethod(st, "getState") as? Int ?: -1
                 } catch (_: Throwable) {
                     return
                 }
@@ -2413,8 +2384,8 @@ object HdrBoostHook {
                 var st2 = state
                 if (st2 < 0) {
                     try {
-                        val st = XposedHelpers.callMethod(rec, "getStateWithUpdatedPosition") ?: return
-                        st2 = XposedHelpers.callMethod(st, "getState") as? Int ?: -1
+                        val st = XpHelpers.callMethod(rec, "getStateWithUpdatedPosition") ?: return
+                        st2 = XpHelpers.callMethod(st, "getState") as? Int ?: -1
                     } catch (_: Throwable) {
                     }
                 }
@@ -2425,13 +2396,10 @@ object HdrBoostHook {
     }
 
     /**
-     * 前台是否"正在放视频"。
+     * 前台是否正在播放带 HDR 元数据的媒体。
      *
-     * 只认两个条件同时成立，绝不看音频（音频误判面太大：任何媒体播放都会命中）：
-     *   ① 前台应用自己发布了处于 PLAYING 的 MediaSession（说明它在放内容）
-     *   ② 前台窗口是全屏/沉浸态（视频播放的典型形态，音乐 App 通常不是）
-     *
-     * 全屏判据优先用 FLAG_FULLSCREEN，取不到则退化为"窗口高度 ≥ 屏幕高度 95%"。
+     * 只认「前台包名处于 PLAYING 的 MediaSession」+「SF 图层带 HDR 元数据」；
+     * 暂停会话、纯音频会话和没有 HDR 证据的 SDR 视频都不提亮。
      */
     private fun videoPlaying(): Boolean {
         if (!videoEnabled()) return false
@@ -2441,21 +2409,16 @@ object HdrBoostHook {
             val e = it.next()
             if (now - e.value > 30000L) it.remove()
         }
-        val it2 = sessionPkgs.entries.iterator()
-        while (it2.hasNext()) {
-            val e = it2.next()
-            if (now - e.value > 600000L) it2.remove()
-        }
         val pkg = focusedPackage() ?: return false
-        if (!playingPkgs.containsKey(pkg) && !sessionPkgs.containsKey(pkg)) return false
-        // 只要该应用有媒体会话即算（不再要求全屏/半屏，HDR 内容为准）
+        if (!playingPkgs.containsKey(pkg)) return false
+        // 还必须有 HDR 内容证据；普通 SDR 视频/音频一律不提亮。
         // ★ 关键闸门：必须拿到「HDR 内容」证据，普通 SDR 视频一律不提亮。
         // 证据来自 SurfaceFlinger：图层携带 HDR 元数据时 SF 才认为在放 HDR
         // （与 HWC 是否支持 HDR 无关）。transact(21012) 就是 ColorOS 自己用的那条。
         val hdr = sfLayerHasHdrMetadata()
         if (hdr == true) return true
         logEvery("sdrsafe", 5000L) {
-            "$TAG: fullscreen media without HDR content -> no boost (SDR safe, hdrLayer=" + hdr + ")"
+            "$TAG: playing media without HDR content -> no boost (SDR safe, hdrLayer=" + hdr + ")"
         }
         return false
     }
@@ -2467,25 +2430,32 @@ object HdrBoostHook {
     // 而 SDR 片源全部是 types=0。这是与播放器实现无关、且不依赖 HWC 支持 HDR 的硬证据。
     // （ColorOS 的 transact(21012) 不行：它要求真正进入 HDR 合成，本机 HWC 不支持，恒 0。）
     //
-    // 成本控制：只在「全屏 + 媒体会话」成立时才查；结果缓存 2s；
-    // 用管道并发读取并**命中即停**，避免 237KB 全量解析和管道阻塞。
+    // 成本控制：只在前台应用有正在播放的媒体会话时查询 SF；结果缓存 2s；
+    // 管道并发读取、命中即停，避免 237KB 全量解析和管道阻塞。
     @Volatile private var hdrMetaCache: Boolean? = null
     @Volatile private var hdrMetaAt = 0L
+    @Volatile private var hdrQueryAt = 0L
+    private val watcherLock = java.util.concurrent.locks.ReentrantLock()
+    private val watcherWakeup: java.util.concurrent.locks.Condition = watcherLock.newCondition()
+    private val recheckPending = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private fun sfLayerHasHdrMetadata(): Boolean? {
         val now = android.os.SystemClock.elapsedRealtime()
         val cached = hdrMetaCache
-        if (cached != null && now - hdrMetaAt < 2000L) return cached
+        val pending = recheckPending.get()
+        if (!pending && cached != null && now - hdrMetaAt < 2000L) return cached
+        if (recheckPending.compareAndSet(true, false)) hdrQueryAt = 0L
+        if (now - hdrQueryAt < 800L) return null
+        hdrQueryAt = now
         val v = querySfLayerHdr()
-        // 无论成功失败都要刷新时间：失败时若不刷新，会退化成每 400ms 一次「新线程 + 全量 SF dump」，
-        // 而 binder.dump 是同步的，reader.join(1500) 会把 watcher 线程阻塞住。
-        hdrMetaAt = now
-        if (v != null) {
-            hdrMetaCache = v
-        } else {
+        if (v == null) {
+            hdrMetaCache = null
             logEvery("sffail", 30000L) { "$TAG: SF layer dump failed (HDR evidence unavailable)" }
+            return null
         }
-        return v ?: cached
+        hdrMetaAt = now
+        hdrMetaCache = v
+        return v
     }
 
     private val HDR_META_RE = Regex("hdr metadata types=([0-9]+)")
@@ -2533,68 +2503,38 @@ object HdrBoostHook {
             }
         }
         reader.join(1500L)
-        hit.get()
-    } catch (_: Throwable) {
+        if (reader.isAlive) {
+            try {
+                readFd.close()
+            } catch (_: Throwable) {
+            }
+            reader.interrupt()
+            return null
+        }
+        hit.get()    } catch (_: Throwable) {
         null
     }
 
-    /** 事件驱动：一旦有媒体会话/窗口变化，立刻重算一次，不等下一轮轮询 */
-    @Volatile private var recheckAt = 0L
+    /** 事件驱动：标记一次待复查并唤醒 watcher；失败不会把旧 true 续命。 */
     private fun recheckNow() {
-        val now = android.os.SystemClock.elapsedRealtime()
-        // UI 动画期间 relayout 每秒几十次，不节流会把 2s 的 SF 缓存打穿成每轮一次全量 dump
-        if (now - recheckAt < 800L) return
-        recheckAt = now
-        hdrMetaCache = null // 失效缓存，强制重查
-    }
-
-    /** 前台窗口是否全屏/沉浸（用于把"音乐 App 前台播放"排除掉） */
-    private fun focusedWindowFullscreen(): Boolean = try {
-        val w = wms ?: return false
-        val root = XposedHelpers.getObjectField(w, "mRoot")
-        val dc = XposedHelpers.callMethod(root, "getTopFocusedDisplayContent")
-        val win = XposedHelpers.getObjectField(dc, "mCurrentFocus") ?: return false
-        val attrs = XposedHelpers.getObjectField(win, "mAttrs")
-        val flags = try {
-            XposedHelpers.getIntField(attrs, "flags")
-        } catch (_: Throwable) {
-            0
+        recheckPending.set(true)
+        hdrMetaCache = null
+        hdrMetaAt = 0L
+        watcherLock.lock()
+        try {
+            watcherWakeup.signalAll()
+        } finally {
+            watcherLock.unlock()
         }
-        if ((flags and 0x400) != 0) return true // FLAG_FULLSCREEN
-        // 退化判据：窗口高度接近屏幕高度
-        val frames = try {
-            XposedHelpers.callMethod(win, "getWindowFrames")
-        } catch (_: Throwable) {
-            null
-        } ?: return false
-        val frame = try {
-            XposedHelpers.getObjectField(frames, "mFrame")
-        } catch (_: Throwable) {
-            null
-        } ?: return false
-        val h = try {
-            XposedHelpers.getIntField(frame, "bottom") - XposedHelpers.getIntField(frame, "top")
-        } catch (_: Throwable) {
-            0
-        }
-        val dh = try {
-            val info = XposedHelpers.callMethod(dc, "getDisplayInfo")
-            XposedHelpers.getIntField(info, "logicalHeight")
-        } catch (_: Throwable) {
-            0
-        }
-        h > 0 && dh > 0 && h >= dh * 0.95f
-    } catch (_: Throwable) {
-        false
     }
 
     private fun focusedPackage(): String? = try {
         val w = wms ?: return null
-        val root = XposedHelpers.getObjectField(w, "mRoot")
-        val dc = XposedHelpers.callMethod(root, "getTopFocusedDisplayContent")
-        val win = XposedHelpers.getObjectField(dc, "mCurrentFocus") ?: return null
-        val attrs = XposedHelpers.getObjectField(win, "mAttrs")
-        XposedHelpers.getObjectField(attrs, "packageName") as? String
+        val root = XpHelpers.getObjectField(w, "mRoot")
+        val dc = XpHelpers.callMethod(root, "getTopFocusedDisplayContent") ?: return null
+        val win = XpHelpers.getObjectField(dc, "mCurrentFocus") ?: return null
+        val attrs = XpHelpers.getObjectField(win, "mAttrs")
+        XpHelpers.getObjectField(attrs, "packageName") as? String
     } catch (_: Throwable) {
         null
     }
@@ -2603,13 +2543,13 @@ object HdrBoostHook {
     private fun hookWindowManager(classLoader: ClassLoader): Int {
         var n = 0
         try {
-            val cls = XposedHelpers.findClass("com.android.server.wm.WindowManagerService", classLoader)
-            XposedBridge.hookAllConstructors(cls, object : XC_MethodHook() {
+            val cls = XpHelpers.findClass("com.android.server.wm.WindowManagerService", classLoader)
+            Xp.hookAllConstructors(cls, object : XpHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     wms = param.thisObject
                 }
             })
-            n += hookAll(cls, "relayoutWindow", object : XC_MethodHook() {
+            n += hookAll(cls, "relayoutWindow", object : XpHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     if (wms == null) wms = param.thisObject
                     try {
@@ -2618,7 +2558,7 @@ object HdrBoostHook {
                         val client = args[1] ?: return
                         val attrs = args[2] ?: return
                         val vis = (args[5] as? Int) ?: -1
-                        val cm = XposedHelpers.callMethod(attrs, "getColorMode") as? Int ?: 0
+                        val cm = XpHelpers.callMethod(attrs, "getColorMode") as? Int ?: 0
                         if (cm == COLOR_MODE_HDR && vis == 0) hdrWindows.add(client)
                         else hdrWindows.remove(client)
                         if (vis == 0) recheckNow()
@@ -2626,14 +2566,14 @@ object HdrBoostHook {
                     }
                 }
             })
-            n += hookAll(cls, "removeWindow", object : XC_MethodHook() {
+            n += hookAll(cls, "removeWindow", object : XpHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val client = param.args.getOrNull(1) ?: return
                     hdrWindows.remove(client)
                 }
             })
         } catch (t: Throwable) {
-            XposedBridge.log("$TAG: WMS not found: " + t.message)
+            Xp.log("$TAG: WMS not found: " + t.message)
         }
         return n
     }
@@ -2641,35 +2581,49 @@ object HdrBoostHook {
     /** 焦点窗口是否请求 HDR；null = 反射失败 */
     private fun focusedWindowHdr(): Boolean? = try {
         val w = wms ?: return null
-        val root = XposedHelpers.getObjectField(w, "mRoot")
-        val dc = XposedHelpers.callMethod(root, "getTopFocusedDisplayContent")
+        val root = XpHelpers.getObjectField(w, "mRoot")
+        val dc = XpHelpers.callMethod(root, "getTopFocusedDisplayContent") ?: return null
         // Android 16 的 DisplayContent 没有 getFocusedWindow()，直接读 mCurrentFocus
-        val win = XposedHelpers.getObjectField(dc, "mCurrentFocus") ?: return false
-        val attrs = XposedHelpers.getObjectField(win, "mAttrs")
-        (XposedHelpers.callMethod(attrs, "getColorMode") as Int) == COLOR_MODE_HDR
+        val win = XpHelpers.getObjectField(dc, "mCurrentFocus") ?: return false
+        val attrs = XpHelpers.getObjectField(win, "mAttrs")
+        (XpHelpers.callMethod(attrs, "getColorMode") as Int) == COLOR_MODE_HDR
     } catch (t: Throwable) {
         logEvery("focusfail", 10000L) { "$TAG: focus poll failed: " + t }
         null
     }
 
     /** SurfaceFlinger 是否正在播放 HDR（真 HDR 视频走这条，正常机型也走这条） */
-    private fun sfHdrPlaying(): Boolean = try {
-        val flinger = Class.forName("android.os.ServiceManager")
-            .getMethod("getService", String::class.java)
-            .invoke(null, "SurfaceFlinger") ?: return false
-        val parcelCls = Class.forName("android.os.Parcel")
-        val data = parcelCls.getMethod("obtain").invoke(null)
-        val reply = parcelCls.getMethod("obtain").invoke(null)
-        parcelCls.getMethod("writeInterfaceToken", String::class.java).invoke(data, SF_TOKEN)
-        flinger.javaClass.getMethod(
-            "transact", Int::class.javaPrimitiveType, parcelCls, parcelCls, Int::class.javaPrimitiveType
-        ).invoke(flinger, CODE_GET_HDR_STATE, data, reply, 0)
-        val v = parcelCls.getMethod("readInt").invoke(reply) as Int
-        parcelCls.getMethod("recycle").invoke(data)
-        parcelCls.getMethod("recycle").invoke(reply)
-        v == 1
-    } catch (_: Throwable) {
-        false
+    private fun sfHdrPlaying(): Boolean {
+        var parcelCls: Class<*>? = null
+        var data: Any? = null
+        var reply: Any? = null
+        return try {
+            val flinger = Class.forName("android.os.ServiceManager")
+                .getMethod("getService", String::class.java)
+                .invoke(null, "SurfaceFlinger") ?: return false
+            val c = Class.forName("android.os.Parcel")
+            parcelCls = c
+            data = c.getMethod("obtain").invoke(null)
+            reply = c.getMethod("obtain").invoke(null)
+            c.getMethod("writeInterfaceToken", String::class.java).invoke(data, SF_TOKEN)
+            flinger.javaClass.getMethod(
+                "transact", Int::class.javaPrimitiveType, c, c, Int::class.javaPrimitiveType
+            ).invoke(flinger, CODE_GET_HDR_STATE, data, reply, 0)
+            val v = c.getMethod("readInt").invoke(reply) as Int
+            v == 1
+        } catch (_: Throwable) {
+            false
+        } finally {
+            val c = parcelCls
+            if (c != null) {
+                try {
+                    val recycle = c.getMethod("recycle")
+                    data?.let { recycle.invoke(it) }
+                    reply?.let { recycle.invoke(it) }
+                } catch (_: Throwable) {
+                }
+            }
+        }
     }
 
     // ── 状态机 ──────────────────────────────────────────────
@@ -2677,123 +2631,128 @@ object HdrBoostHook {
         Thread {
             while (true) {
                 try {
-                    // ① 链路自检：DPC/Adapter 构造顺序、或系统把 spline 换回去时，都要能自愈
-                    refreshSpecificMode()
-                    // ② 退出 HDR 后的收尾：gateUntil 只是「允许继续写」的窗口，
-                    //    如果退出时没有产生任何亮度事件，比值会永远停在旧值。
-                    //    这里在窗口到期时主动把比值归 1.0（归零不算干预亮度）。
-                    val nowTail = android.os.SystemClock.elapsedRealtime()
-                    if (!hdrOn && gateUntil != 0L && nowTail >= gateUntil) {
+                    if (!enabled()) {
+                        trailHandler.removeCallbacks(trailRunnable)
+                        pendingRatio.set(null)
+                        hdrWindows.clear()
+                        playingPkgs.clear()
+                        if (hdrOn) hdrOn = false
                         gateUntil = 0L
-                        val cur = currentHdrSdrRatio().let { if (it.isNaN()) 1f else it }
-                        if (Math.abs(cur - 1f) > 0.05f) {
-                            lastForcedRatio = 1.0f
-                            lastForceAt = nowTail
-                            forceHdrSdrRatio(1.0f)
-                            XposedBridge.log("$TAG: ratio tail-restore 1.0 (was " + f2(cur) + ")")
-                        }
-                    }
-                    // ③ 专项链路自检：AOSP 链路本该在 HDR 出现后立刻自己算出比值。
-                    //    如果 2 秒后系统仍然只报 1.0，说明这条 ROM 上 SF 没把 HDR 信息送下来，
-                    //    本会话退回通用兜底。
-                    if (hdrOn && specificMode && !specFallback &&
-                        nowTail - hdrOnSince > 2000L &&
-                        currentHdrSdrRatio() <= 1.05f
-                    ) {
-                        specFallback = true
-                        XposedBridge.log(
-                            "$TAG: specific chain ineffective after 2s (ratio=" +
-                                f2(currentHdrSdrRatio()) + ") -> fallback to GENERIC for this session"
-                        )
-                    }
-                    // 三条信号：① 焦点窗口 colorMode ② 视频播放中 ③ 兜底（relayout 集合 / SF）
-                    val focus = focusedWindowHdr()
-                    val video = videoPlaying()
-                    val raw = when {
-                        focus == true -> true
-                        video -> true
-                        focus == null -> hdrWindows.isNotEmpty() || sfHdrPlaying()
-                        // 兜底：窗口没设 colorMode、也没有媒体会话的播放器（很多第三方播放器都是这样），
-                        // 只要 SurfaceFlinger 里有图层带 HDR 元数据，就认为在放 HDR。
-                        // 这是最接近「事实」的信号，不依赖应用配合。
-                        else -> sfLayerHasHdrMetadata() == true || hdrWindows.isNotEmpty()
-                    }
-                    // 退出迟滞（仅类原生）：HDR 图片/瞬时窗口会让状态在几百毫秒内抖动，
-                    // 直连面板时表现为「闪一下又回去」。熄灭前要求连续缺失 HDR_EXIT_HOLD_MS。
-                    val nowMs = android.os.SystemClock.elapsedRealtime()
-                    val want = if (!raw && hdrOn && aospMode) {
-                        if (hdrOffSince == 0L) hdrOffSince = nowMs
-                        (nowMs - hdrOffSince) < HDR_EXIT_HOLD_MS
+                        specFallback = false
+                        hdrOffSince = 0L
+                        lastForcedRatio = Float.NaN
                     } else {
-                        if (raw) hdrOffSince = 0L
-                        raw
-                    }
-                    if (want != hdrOn) {
-                        hdrOn = want
-                        if (!want) {
-                            gateUntil = android.os.SystemClock.elapsedRealtime() + 5000L
-                            // 退出时清掉会话级回退，下次 HDR 重新尝试专项链路
-                            specFallback = false
-                        } else {
-                            lastForcedRatio = Float.NaN
-                            hdrOnSince = android.os.SystemClock.elapsedRealtime()
-                        }
-                        // 专项链路：全部交给系统（曲线 + 门禁已就位）。
-                        // 注意 700ms 的 postDelayed 也必须一起挡住，否则专项链路下仍会点火。
-                        val d = hdrEnhance
-                        if (!specOn()) {
-                            if (d != null) callPriv(d, "checkIsPlayingHDR")
-                            // 原生驱动会自己 sendUpdatePowerState；没有驱动时必须自己点火
-                            requestPowerUpdate()
-                            // 类原生：主动把面板亮度推到顶（并保留 SDR 白点），否则永远等不到亮度变化事件
-                            pushAospBrightness(want)
-                            // 类原生：强制进/出 HBM（等效于「改 displayconfig + 删 jar 门禁」那条路）
-                            applyHbm(want)
-                            try {
-                                val h = dpcHandler
-                                if (h != null) h.postDelayed({ requestPowerUpdate() }, 700L)
-                            } catch (_: Throwable) {
-                            }
-                            // 用翻转时的 want + 代数校验：HDR 快速开关时，旧回调不能把新状态顶掉
-                            val gen = ++stateGen
-                            try {
-                                val h = dpcHandler
-                                if (h != null) {
-                                    h.postDelayed({ if (gen == stateGen) pushAospBrightness(want) }, 700L)
+                        refreshSpecificMode()
+                        val nowTail = android.os.SystemClock.elapsedRealtime()
+                        if (aospMode && !hdrOn && gateUntil != 0L && nowTail >= gateUntil) {
+                            gateUntil = 0L
+                            val cur = currentHdrSdrRatio()
+                            // NaN 是合法的「不可用」状态；只清理残留的有限旧比值，不伪装成 1.0。
+                            if (!cur.isNaN() && Math.abs(cur - 1f) > 0.05f) {
+                                if (forceHdrSdrRatio(aospDev, 1.0f)) {
+                                    lastForcedRatio = 1.0f
+                                    lastForceAt = nowTail
+                                    Xp.log("$TAG: ratio tail-restore 1.0 (was " + f2(cur) + ")")
                                 }
-                            } catch (_: Throwable) {
                             }
                         }
-                        val why = when {
-                            focus == true -> "focus=true"
-                            video -> "video playing"
-                            focus == null -> "fallback"
-                            else -> "focus=false"
+                        if (hdrOn && specificMode && !specFallback &&
+                            nowTail - hdrOnSince > 2000L
+                        ) {
+                            val cur = currentHdrSdrRatio()
+                            if (cur.isNaN() || cur <= 1.05f) {
+                                specFallback = true
+                                Xp.log(
+                                    "$TAG: specific chain ineffective after 2s (ratio=" +
+                                        f2(cur) + ") -> fallback to GENERIC for this session"
+                                )
+                            }
                         }
-                        XposedBridge.log(
-                            "$TAG: HDR -> " + want + "(" + why + ") [" + driverState(d) + "]"
-                        )
-                    } else if (want) {
-                        // HDR 开着但驱动没进提亮态 -> 3s 报一次，便于定位
-                        logEvery("stuck", 3000L) {
-                            val st = driverState(hdrEnhance)
-                            if (st.contains("enhanced=false") || st.contains("need=false")) {
-                                "$TAG: HDR on but driver idle [" + st + "]"
+                        val focus = focusedWindowHdr()
+                        val video = videoPlaying()
+                        val raw = when {
+                            focus == true -> true
+                            video -> true
+                            focus == null -> hdrWindows.isNotEmpty() || sfHdrPlaying()
+                            else -> sfLayerHasHdrMetadata() == true || hdrWindows.isNotEmpty()
+                        }
+                        val nowMs = android.os.SystemClock.elapsedRealtime()
+                        val want = if (!raw && hdrOn && aospMode) {
+                            if (hdrOffSince == 0L) hdrOffSince = nowMs
+                            (nowMs - hdrOffSince) < HDR_EXIT_HOLD_MS
+                        } else {
+                            if (raw) hdrOffSince = 0L
+                            raw
+                        }
+                        if (want != hdrOn) {
+                            hdrOn = want
+                            if (!want) {
+                                gateUntil = nowMs + 5000L
+                                specFallback = false
                             } else {
-                                ""
+                                lastForcedRatio = Float.NaN
+                                hdrOnSince = nowMs
+                            }
+                            val gen = ++stateGen
+                            val d = hdrEnhance
+                            if (!specOn()) {
+                                if (d != null) callPriv(d, "checkIsPlayingHDR")
+                                requestPowerUpdate()
+                                pushAospBrightness(want)
+                                applyHbm(want)
+                                try {
+                                    val h = dpcHandler
+                                    if (h != null) {
+                                        h.postDelayed({
+                                            if (gen == stateGen && enabled()) requestPowerUpdate()
+                                        }, 700L)
+                                    }
+                                } catch (_: Throwable) {
+                                }
+                                try {
+                                    val h = dpcHandler
+                                    if (h != null) {
+                                        h.postDelayed({
+                                            if (gen == stateGen && enabled()) pushAospBrightness(want)
+                                        }, 700L)
+                                    }
+                                } catch (_: Throwable) {
+                                }
+                            }
+                            val why = when {
+                                focus == true -> "focus=true"
+                                video -> "video playing"
+                                focus == null -> "fallback"
+                                else -> "focus=false"
+                            }
+                            Xp.log(
+                                "$TAG: HDR -> " + want + "(" + why + ") [" + driverState(d) + "]"
+                            )
+                        } else if (want) {
+                            logEvery("stuck", 3000L) {
+                                val st = driverState(hdrEnhance)
+                                if (st.contains("enhanced=false") || st.contains("need=false")) {
+                                    "$TAG: HDR on but driver idle [" + st + "]"
+                                } else {
+                                    ""
+                                }
                             }
                         }
                     }
                 } catch (t: Throwable) {
-                    // 不能静默：这里一旦持续异常，hdrOn 永远不翻转，日志里却只剩 "watcher started"
                     logEvery("watchfail", 5000L) { "$TAG: watcher loop failed: " + t }
                 }
+                watcherLock.lock()
                 try {
-                    Thread.sleep(POLL_MS)
-                } catch (_: InterruptedException) {
+                    try {
+                        watcherWakeup.await(POLL_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    } catch (_: InterruptedException) {
+                    }
+                } finally {
+                    watcherLock.unlock()
                 }
             }
         }.apply { isDaemon = true; name = "FkHdr" }.start()
-        XposedBridge.log("$TAG: watcher started")
+        Xp.log("$TAG: watcher started")
     }
 }

@@ -25,12 +25,14 @@ class MainActivity : Activity() {
 
     private lateinit var hdrSwitch: Switch
     private lateinit var statusText: TextView
-    private lateinit var gateSwitch: Switch
     private lateinit var capValue: TextView
     private lateinit var capSeek: SeekBar
 
     /** 程序化回写开关状态时置位，避免触发监听器造成回环写入 */
     private var binding = false
+
+    /** SeekBar 拖动中的待持久化值；只在手指松开时写一次，避免每个 tick 同步 IO / su。 */
+    private var pendingCapValue: Float? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -45,35 +47,74 @@ class MainActivity : Activity() {
         // 自愈：模块未激活时写 Settings.System 会被拒（无 WRITE_SETTINGS / 无 root），
         // 值只落到本地 prefs。等模块激活（SettingsProviderHook 生效）后，
         // 每次回到界面都把本地值补写回 Settings.System，保证 system_server 读得到。
-        try {
-            if (::hdrSwitch.isInitialized) {
-                Config.writeConfig(this, Config.KEY_HDR_RATIO, hdrSwitch.isChecked)
-            }
-            Config.setRatioMax(this, Config.getRatioMax())
-        } catch (_: Throwable) {
+        if (::hdrSwitch.isInitialized) {
+            val switchState = hdrSwitch.isChecked
+            Thread {
+                val cap = Config.getRatioMax()
+                val switchOk = Config.writeConfig(applicationContext, Config.KEY_HDR_RATIO, switchState)
+                val capOk = Config.setRatioMax(applicationContext, cap)
+                runOnUiThread {
+                    if (!switchOk) {
+                        verifyIntSetting(Config.KEY_HDR_RATIO, if (switchState) 1 else 0, "HDR 提亮开关")
+                    }
+                    if (!capOk) {
+                        verifyFloatSetting(Config.KEY_RATIO_MAX, cap, "比值封顶上限")
+                    }
+                }
+            }.start()
         }
     }
 
     /**
-     * 写入后回读校验。
-     *
-     * 开关是靠 Settings.System 传给 system_server 的（LSPosed 注入的进程读不到本模块私有 prefs），
-     * 而普通应用默认没有 WRITE_SETTINGS 权限。两条兜底：
-     *   ① LSPosed 作用域勾了 com.android.providers.settings -> SettingsProviderHook 放行写入
-     *   ② 有 root -> su 写入
-     * 两条都不通时开关只是「看起来切了」，必须明确告诉用户，否则会以为模块坏了。
+     * 写入失败后延迟回读：Config 的 su 兜底是异步的，不能只看 putInt/putFloat 的返回值就报错。
+     * 若 1.5s 后 Settings.System 仍不是预期值，明确提示用户模块作用域或 root 未生效。
      */
-    private fun verifyPersisted(isChecked: Boolean) {
-        val expected = if (isChecked) 1 else 0
+    private fun verifyIntSetting(key: String, expected: Int, label: String) {
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            if (Config.getSettingInt(Config.KEY_HDR_RATIO) == expected) return@postDelayed
-            android.widget.Toast.makeText(
-                this,
-                "开关未能写入系统设置。请在 LSPosed 中为本模块勾选「设置存储 (com.android.providers.settings)」" +
-                    "作用域，或授予本应用 root 权限后重试。",
-                android.widget.Toast.LENGTH_LONG
-            ).show()
-        }, 1500)
+            if (Config.getSettingInt(key) == expected) return@postDelayed
+            showWriteFailure(label)
+        }, 1500L)
+    }
+
+    private fun verifyFloatSetting(key: String, expected: Float, label: String) {
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            val actual = Config.getSettingFloat(key, Float.NaN)
+            if (!actual.isNaN() && Math.abs(actual - expected) < 0.01f) return@postDelayed
+            showWriteFailure(label)
+        }, 1500L)
+    }
+
+    private fun showWriteFailure(label: String) {
+        android.widget.Toast.makeText(
+            applicationContext,
+            "「" + label + "」未能写入系统设置。请在 LSPosed 中为本模块勾选" +
+                "「设置存储 (com.android.providers.settings)」作用域，或授予本应用 root 权限后重试。",
+            android.widget.Toast.LENGTH_LONG
+        ).show()
+    }
+
+    private fun persistHdrSwitch(isChecked: Boolean) {
+        Thread {
+            val ok = Config.writeConfig(applicationContext, Config.KEY_HDR_RATIO, isChecked)
+            runOnUiThread {
+                if (!ok) {
+                    verifyIntSetting(Config.KEY_HDR_RATIO, if (isChecked) 1 else 0, "HDR 提亮开关")
+                }
+            }
+        }.start()
+    }
+
+    private fun persistRatioMax(value: Float, switchState: Boolean) {
+        Thread {
+            val capOk = Config.setRatioMax(applicationContext, value)
+            val switchOk = Config.writeConfig(applicationContext, Config.KEY_HDR_RATIO, switchState)
+            runOnUiThread {
+                if (!capOk) verifyFloatSetting(Config.KEY_RATIO_MAX, value, "比值封顶上限")
+                if (!switchOk) {
+                    verifyIntSetting(Config.KEY_HDR_RATIO, if (switchState) 1 else 0, "HDR 提亮开关")
+                }
+            }
+        }.start()
     }
 
     // ── UI 构建 ─────────────────────────────────────────────
@@ -106,9 +147,8 @@ class MainActivity : Activity() {
             isChecked = false
             setOnCheckedChangeListener { _, isChecked ->
                 if (binding) return@setOnCheckedChangeListener
-                Config.writeConfig(this@MainActivity, Config.KEY_HDR_RATIO, isChecked)
                 applyState(isChecked)
-                verifyPersisted(isChecked)
+                persistHdrSwitch(isChecked)
             }
         }
         row.addView(hdrSwitch, LinearLayout.LayoutParams(WRAP, WRAP))
@@ -138,14 +178,16 @@ class MainActivity : Activity() {
                 override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                     val v = Config.MIN_RATIO_MAX + progress / 2f
                     capValue.text = String.format("%.1f", v)
-                    if (fromUser) {
-                        Config.setRatioMax(this@MainActivity, v)
-                        Config.writeConfig(this@MainActivity, Config.KEY_HDR_RATIO, hdrSwitch.isChecked)
-                    }
+                    if (fromUser) pendingCapValue = v
                 }
 
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
+
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    val v = pendingCapValue ?: return
+                    pendingCapValue = null
+                    persistRatioMax(v, hdrSwitch.isChecked)
+                }
             })
         }
         capValue.text = String.format("%.1f", Config.getRatioMax())
@@ -158,34 +200,6 @@ class MainActivity : Activity() {
             ).withTop(dp(6))
         )
         root.addView(capCard)
-
-        // 门禁守护卡片（默认关闭：开机置位一次即可）
-        val wdCard = card().withTop(dp(12))
-        val wdRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = android.view.Gravity.CENTER_VERTICAL
-        }
-        wdRow.addView(
-            text("门禁守护（每 3 秒重申）", 16f, TEXT, true),
-            LinearLayout.LayoutParams(0, WRAP, 1f)
-        )
-        gateSwitch = Switch(this).apply {
-            isChecked = Config.getGateWatchdog()
-            setOnCheckedChangeListener { _, isChecked ->
-                if (binding) return@setOnCheckedChangeListener
-                Config.writeConfig(this@MainActivity, Config.KEY_GATE_WATCHDOG, isChecked)
-            }
-        }
-        wdRow.addView(gateSwitch, LinearLayout.LayoutParams(WRAP, WRAP))
-        wdCard.addView(wdRow)
-        wdCard.addView(
-            text(
-                "默认关闭。正常情况下模块在开机注入时把厂商门禁置位一次就够了。" +
-                    "只有发现 HDR 用一会儿又失效（说明 ROM 在运行中把标志重置了）时才需要打开。",
-                13f, BODY
-            ).withTop(dp(6))
-        )
-        root.addView(wdCard)
 
         // 作用
         val effect = card().withTop(dp(12))

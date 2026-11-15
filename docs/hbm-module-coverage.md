@@ -1,5 +1,7 @@
 # 设备上「改配置 + 反编译 jar」HDR 模块的完整解码与 FkHDR 覆盖度
 
+> ⚠️ 历史记录（截至 v1.6.1）：本文的字段名、版本号、日志样例与实现结论只描述当时的样本；当前 FkHDR v1.6.2 的行为以 [AOSP 对齐记录](aosp-alignment.md) 与 [hdr-module/README.md](../hdr-module/README.md) 为准。
+
 > 样本：Redmi xaga（HyperOS 3 / Android 15）上的 `hdr_sdr_ratio_fix` 模块 v1（作者：囫碾）
 > 方法：从模块目录取文件 → 与 stock 分区逐字节对比（stock 通过 `mount -t erofs -o ro /dev/block/dm-{2,3}` 取得）
 

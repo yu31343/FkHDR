@@ -1,5 +1,7 @@
 # FkOScreen HDR 修复模块 — 功能总览（v1.7.1）
 
+> ⚠️ 历史记录（截至 v1.6.1）：本文的字段名、版本号、日志样例与实现结论只描述当时的样本；当前 FkHDR v1.6.2 的行为以 [AOSP 对齐记录](aosp-alignment.md) 与 [hdr-module/README.md](../hdr-module/README.md) 为准。
+
 > 目标：让 ColorOS 设备在 **面板/HWC 不支持 HDR 合成** 的前提下，仍然把
 > 「HDR 峰值亮度 + SDR/HDR 调光比率」做到与正常 HDR 设备一致的**亮度维度**表现。
 

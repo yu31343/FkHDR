@@ -1,5 +1,7 @@
 # 会话交接文档（HANDOFF）
 
+> ⚠️ 历史记录（截至 v1.6.1）：本文的字段名、版本号、日志样例与实现结论只描述当时的样本；当前 FkHDR v1.6.2 的行为以 [AOSP 对齐记录](aosp-alignment.md) 与 [hdr-module/README.md](../hdr-module/README.md) 为准。
+
 > 最后更新：v1.9.4 / 2026-10-25（HDR 已拆分为独立模块 FkHDR）
 > 目的：下次会话 5 分钟内进入状态，不必重新逆向。
 

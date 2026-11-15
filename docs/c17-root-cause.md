@@ -1,5 +1,7 @@
 # ColorOS 17（Android 17 / SDK 37）HDR 提亮失效根因
 
+> ⚠️ 历史记录（截至 v1.6.1）：本文的字段名、版本号、日志样例与实现结论只描述当时的样本；当前 FkHDR v1.6.2 的行为以 [AOSP 对齐记录](aosp-alignment.md) 与 [hdr-module/README.md](../hdr-module/README.md) 为准。
+
 设备：OPD2404，`ro.build.version.oplusrom=V17.0.0`，`sdk=37`
 对照：ColorOS 16（`V16.0.0`，`sdk=36`）
 
