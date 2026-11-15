@@ -96,9 +96,19 @@ su -c 'killall system_server'
 |---|---|---|
 | `persist.sys.fkhdr.fix` | 开 | `0` = 关闭整个模块；所有状态写入、提亮请求、watcher 与延迟写入都会复查，关闭期间清空 HDR 判定缓存 |
 | `persist.sys.fkhdr.factor` | 100 | 提亮倍数，由面板 nit 上限截断 |
-| `persist.sys.fkhdr.ratio_max` | 5.0 | 亮度目标与 spline 端点上限；**不用于截断 AOSP 原始比值** |
+| `persist.sys.fkhdr.ratio_max` | 5.0 | 人工覆盖面板曲线推出的上限（`ratioCapAt` 优先用它）；界面滑块走的是 Settings.System，不是这个属性 |
 | `persist.sys.fkhdr.native` | 1 | `0` = 不用 OPPO 原生驱动 |
 | `persist.sys.fkhdr.fallback` | 1 | `0` = 关闭 ColorOS 后处理兜底 |
+
+### 比值封顶上限：App 里实时生效
+
+`hdr_ratio_max`（Settings.System，默认 5.0，范围 1.0–20.0）由界面滑块写入，写进去之后：
+
+- `ratioCap()` 的缓存 TTL 是 1 秒，值一变就打印 `read app ratio cap X -> Y`；
+- watcher 每次唤醒调 `syncRatioCap()`，打印 `app ratio cap X -> Y, applying live`，并按新端点重装 spline（`y=[cap, 1.0]`）；
+- 模块代发的比值都过 `cappedRatio()`，上限调低后当前会话立刻收口。
+
+实测（Android 15 手机，HDR 播放中拖动滑块）：`dumpsys display` 的 `hdrSdrRatio` 在 cap 5.0 时 4.965725，改成 2.0 后 2.0，改回 5.0 后 4.2025065；每次 1 秒内完成，不需要重启 system_server 或应用。Android 16 / ColorOS 平板没有 spline，比值由厂商驱动发布，上限不截断厂商比值。
 | `persist.sys.fkhdr.video` | 1 | `0` = 不把视频播放算作 HDR 场景 |
 | `persist.sys.fkhdr.hbm` | 1 | `0` = 不主动进 HBM |
 | `persist.sys.fkhdr.aosp_force` | 0 | `1` = 在 ColorOS 上也强制走 AOSP 通路（调试用） |

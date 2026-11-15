@@ -195,7 +195,8 @@ class MainActivity : Activity() {
         capCard.addView(
             text(
                 "低亮度时 HDR 高光最多比 SDR 白点亮这么多倍；亮度越高上限自动下降，" +
-                    "拉到最亮时回落到 1.0（无 headroom）。默认 5.0，与旧版配置模块一致。",
+                    "拉到最亮时回落到 1.0（无 headroom）。松手后约 1 秒生效，不用重启。" +
+                    "默认 5.0，与旧版配置模块一致。",
                 13f, BODY
             ).withTop(dp(6))
         )
@@ -230,8 +231,9 @@ class MainActivity : Activity() {
         scope.addView(sectionTitle("生效范围"))
         scope.addView(
             text(
-                "LSPosed 作用域需勾选「系统框架（android）」与「设置存储（com.android.providers.settings）」，" +
-                    "未勾选则开关无效。",
+                "作用域写在 APK 的 META-INF/xposed/scope.list 里：system_server 那条是「系统框架 / system」，" +
+                    "另加「设置存储 com.android.providers.settings」。LSPosed 里启用模块即生效，不用手动勾选；" +
+                    "若管理器里仍显示旧的行（android），禁用再启用一次模块让它重写配置。",
                 14f, BODY
             ).withTop(dp(8))
         )

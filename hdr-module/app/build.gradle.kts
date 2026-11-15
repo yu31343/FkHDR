@@ -15,8 +15,8 @@ android {
         applicationId = "io.github.benbaobaoshigemi.fkhdr"
         minSdk = 26
         targetSdk = 34
-        versionCode = 29
-        versionName = "1.7.2"
+        versionCode = 30
+        versionName = "1.7.3"
     }
 
     signingConfigs {

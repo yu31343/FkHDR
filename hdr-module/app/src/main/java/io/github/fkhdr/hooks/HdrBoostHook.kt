@@ -1363,7 +1363,7 @@ object HdrBoostHook {
             val ratio = if (nits != -1f && sdrNits != -1f && nits.isFinite() &&
                 sdrNits.isFinite() && sdrNits > 0f
             ) {
-                Math.max(1f, nits / sdrNits).takeIf { it.isFinite() } ?: Float.NaN
+                cappedRatio(Math.max(1f, nits / sdrNits)).takeIf { it.isFinite() } ?: Float.NaN
             } else {
                 Float.NaN
             }
@@ -1574,14 +1574,19 @@ object HdrBoostHook {
         return capped
     }
 
-    /** App 可配的封顶上限（Settings.System:hdr_ratio_max，默认 5.0 = 旧模块的值） */
+    /**
+     * App 可配的封顶上限（Settings.System:hdr_ratio_max，默认 5.0 = 旧模块的值）。
+     *
+     * 1 秒 TTL：App 里改完最多 1 秒就生效，不需要重启 system_server，也不需要重启应用；
+     * 代价是 system_server 每秒一次本地 Settings 读（SettingsProvider 就在同一进程内）。
+     */
     @Volatile private var capCache = Float.NaN
     @Volatile private var capAt = 0L
 
     private fun ratioCap(): Float {
         val now = android.os.SystemClock.elapsedRealtime()
         val c = capCache
-        if (!c.isNaN() && now - capAt < 3000L) return c
+        if (!c.isNaN() && now - capAt < 1000L) return c
         val v = try {
             io.github.fkhdr.Config.getRatioMax()
         } catch (_: Throwable) {
@@ -1589,7 +1594,54 @@ object HdrBoostHook {
         }
         capCache = v
         capAt = now
+        if (!c.isNaN() && Math.abs(v - c) > 0.01f) {
+            Xp.log("$TAG: read app ratio cap " + f2(c) + " -> " + f2(v))
+        }
         return v
+    }
+
+    /**
+     * App 改「比值封顶上限」后立即生效。
+     *
+     * 上限有两个落点，都必须跟着变：
+     *   ① 已装进 DisplayDeviceConfig 的曲线端点 y=[cap, 1.0] —— 不重装，系统仍按旧端点算 HDR 亮度；
+     *   ② 当前 HDR 会话已经发布出去的比值 —— 只有 handleHdrSdrNitsChanged 下一次被调用才会重算，
+     *      中间这段时间应用读到的还是旧值，所以这里主动按新上限收口一次。
+     * 值本身由 ratioCap() 每秒从 Settings.System 重读，App 侧写完 1 秒内到这里。
+     */
+    @Volatile private var capApplied = Float.NaN
+
+    private fun syncRatioCap() {
+        if (!enabled()) return
+        val cap = ratioCap()
+        val prev = capApplied
+        capApplied = cap
+        if (prev.isNaN() || Math.abs(cap - prev) < 0.01f) return
+        Xp.log("$TAG: app ratio cap " + f2(prev) + " -> " + f2(cap) + ", applying live")
+        val used = splineCap
+        if (splineInstalled && !used.isNaN() && Math.abs(cap - used) > 0.01f) {
+            splineInstalled = false
+            installSpecificSpline()
+        }
+        val cur = currentHdrSdrRatio()
+        if (!cur.isNaN() && cur > cap + 0.01f && forceHdrSdrRatio(aospDev, cap)) {
+            lastForcedRatio = cap
+            lastForceAt = android.os.SystemClock.elapsedRealtime()
+            Xp.log("$TAG: ratio capped " + f2(cur) + " -> " + f2(cap) + " (app cap)")
+        }
+    }
+
+    /**
+     * 模块发布出去的比值一律受 App 上限约束。
+     *
+     * AOSP 原版只管 nits 比值，上限由 DisplayDeviceConfig 的曲线承担；这里模块代劳了比值
+     * 发布，就得自己按 cap 收口，否则把滑块拉到 2.0 之后的当前 HDR 会话仍会报 4.37。
+     * NaN（不可用）与 1.0（AOSP 下界）原样放行。
+     */
+    private fun cappedRatio(raw: Float): Float {
+        if (raw.isNaN() || raw <= 1f) return raw
+        val cap = ratioCap()
+        return if (cap in 1f..raw) cap else raw
     }
 
     /**
@@ -1621,6 +1673,8 @@ object HdrBoostHook {
     // mHbmData / mHdrBrightnessData.sdrToHdrRatioSpline。
     @Volatile private var specificMode = false
     @Volatile private var splineInstalled = false
+    /** 当前装进系统的曲线用的上限；App 改了 hdr_ratio_max 就要按它判断是否需要重装 */
+    @Volatile private var splineCap = Float.NaN
 
     private fun outerOf(obj: Any): Any? {
         var k: Class<*>? = obj.javaClass
@@ -1736,7 +1790,7 @@ object HdrBoostHook {
                 val ratio = if (nits != -1f && sdrNits != -1f && nits.isFinite() &&
                     sdrNits.isFinite() && sdrNits > 0f
                 ) {
-                    Math.max(1f, nits / sdrNits).takeIf { it.isFinite() } ?: Float.NaN
+                    cappedRatio(Math.max(1f, nits / sdrNits)).takeIf { it.isFinite() } ?: Float.NaN
                 } else {
                     Float.NaN
                 }
@@ -1935,6 +1989,7 @@ object HdrBoostHook {
         return null
     }
 
+    @Synchronized
     private fun installSpecificSpline() {
         if (!aospMode || !enabled() || splineInstalled) return
         val cfg = displayConfig ?: run {
@@ -1973,6 +2028,7 @@ object HdrBoostHook {
             splineOwner = target.owner
             splineShape = target.shape
             splineInstalled = true
+            splineCap = cap
             Xp.log(
                 "$TAG: specific chain sdrHdrRatioSpline replaced (" + target.shape +
                     " " + splineCls.simpleName + " x=[" + f2(xs[0]) + "," + f2(xs[1]) +
@@ -2642,6 +2698,7 @@ object HdrBoostHook {
                         hdrOffSince = 0L
                         lastForcedRatio = Float.NaN
                     } else {
+                        syncRatioCap()
                         refreshSpecificMode()
                         val nowTail = android.os.SystemClock.elapsedRealtime()
                         if (aospMode && !hdrOn && gateUntil != 0L && nowTail >= gateUntil) {

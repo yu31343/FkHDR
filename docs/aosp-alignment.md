@@ -97,6 +97,18 @@ v1.7.0 把入口从 legacy 的 `de.robv.android.xposed:api:82` 换成 `io.github
 - 挂载时机：`SettingsProvider` 只在 `onPackageLoaded` 里挂。Android 13+ 的 SettingsProvider 跑在 system_server 内，但类在它自己的 APK classloader 里，`onSystemServerStarting` 的 system_server loader 必然找不到（v1.7.0 首次真机验证就是这个报错），失败后再用后台重试也只是浪费 20 秒。
 - 观察到的真机事实（Redmi 22041216C / Android 15 / HyperOS / LSPosed 2.2.1）：`lspctl module show` 报 `minApiVersion=102 targetApiVersion=102 legacy=false staticScope=true`，`declaredScope=["android","com.android.providers.settings"]`；system_server 日志出现 `FkHDR:FkModule: loaded api=102 framework=LSPosed/2.2.1`；HDR 播放时 `ratio direct nits=187.02 sdrNits=39.2 -> ratio=4.77`、`ratio forced 4.77`、`aosp push applied brightness=0.19 sdr=0.04`、`hbm hdrLayerPresent=true -> mode=2`。
 
+### 4.7 比值上限可以在 App 里实时改
+
+上限存在 `Settings.System hdr_ratio_max`（默认 5.0，范围 1.0–20.0），界面滑块写入，system_server 侧不需要重启：
+
+- `ratioCap()` 的缓存 TTL 是 1 秒，值一变就打印 `read app ratio cap X -> Y`；
+- watcher 每次唤醒调 `syncRatioCap()`，变化时打印 `app ratio cap X -> Y, applying live` 并按新端点重装 spline（`y=[cap, 1.0]`），所以系统自算的比值立刻跟着变；
+- 模块代发的比值都过 `cappedRatio()`：上限调低后当前 HDR 会话会被直接收口，不必等下一次内容变化。
+
+实测（Android 15 手机，HDR 播放中改上限）：`dumpsys display` 的 `hdrSdrRatio` 在 cap 5.0 时是 4.965725，改成 2.0 后是 2.0，改回 5.0 后是 4.2025065；三次都是 1 秒内完成，没有重启 system_server，也没有重启被测应用。
+
+Android 16 / ColorOS 平板没有 spline 字段，比值由厂商驱动发布，模块只对自家亮度目标与曲线负责 —— 上限在那台机器上不会截断厂商上报的比值（GAP，见 §8）。
+
 ## 5. 跨设备行为
 
 | 设备形状 | 当前行为 |
