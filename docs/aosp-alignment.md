@@ -1,6 +1,6 @@
 # AOSP 对齐记录（HDR / hdrSdrRatio）
 
-> 当前实现：FkHDR v1.8.0（versionCode 34，libxposed API 102）。审查对象是 `hdr-module/`；`module/`（legacy API 82）只作历史参考。
+> 当前实现：FkHDR v1.8.1（versionCode 35，libxposed API 102）。审查对象是 `hdr-module/`；`module/`（legacy API 82）只作历史参考。
 > 设计原则：GENERIC 兜底和 watcher 始终安装；专项链路只是运行时健康开关；不把启动期静态探测当作永久事实。
 > 验证状态：静态审查、Kotlin 编译与 clean release 构建通过；v1.7.6 在两台设备验收通过 —— Redmi 22041216C / Android 15（专项链系统自算）与一加平板 Pro OPD2404 / Android 16 / ColorOS（原生驱动 + GENERIC 兜底，关掉 HDR 后比值 2 秒内回落）；v1.8.0 在平板上新增视频 HDR 的全局 SDR 压暗并实测生效（§4.10），跨 ROM 缺口见 §8。
 
@@ -160,9 +160,27 @@ AOSP 契约在 `frameworks/native` android15-release：`services/surfaceflinger/
 
 实测（一加平板 Pro，HDR10 测试片，上限 5.0）：模块日志 `sdr dim factor=0.200 on 17 window(s), skipped 0 hdr window(s), failed 0 of 17`；`dumpsys SurfaceFlinger` 里 `colorTransform=[[0.200,0.000,0.000,0.000][0.000,0.200,0.000,0.000][0.000,0.000,0.200,0.000][0.000,0.000,0.000,1.000]`；播放器 SDR 按钮区均值 `(95.3, 94.3, 96.2)` → `(41.7, 41.7, 42.7)` → 停止后复原；同一帧 HDR 视频红条 `(255.0, 0.0, 30.2)` 不变；`hdrSdrRatio` 播放中 5.000007、停止后 1.0。
 
-GAP：只在 ColorOS 路径启用；AOSP 栈由系统自己做 per-layer dimming，不能重复压暗。压暗的前提是面板亮度已按比值抬高（本机由厂商驱动保证）。只覆盖登记在 `mWindowMap` 的窗口，SurfaceView 子图层（视频本体）按设计不压。
+GAP：只在 ColorOS 路径启用；AOSP 栈由系统自己做 per-layer dimming，不能重复压暗。压暗的前提是面板亮度已按比值抬高（本机由厂商驱动保证）。只覆盖登记在 `mWindowMap` 的窗口，SurfaceView 子图层（视频本体）按设计不压；面板可见范围受 §4.11 的硬件边界限制。
 
 ---
+### 4.11 面板级压暗的硬件边界（v1.8.1 实测）
+
+v1.8.0 的 `setColorTransform` 只在 GPU 合成时被执行，于是「整屏压暗」在平板上的实际覆盖范围需要写清。HDR 播放中（`hdrSdrRatio=5.000007`）的实测：
+
+```text
+dumpsys SurfaceFlinger 显示级：displayBrightnessNits=496.996185 sdrWhitePointNits=99.399094 displayBrightness=nullopt
+CompositionEngine Output Layer ×7：whitePointNits=496.996185 dimmingRatio=1.000000
+Layer state：dimming enabled=true（全部图层）
+hwc: layer=0x0815d composition=DEVICE (2)
+```
+
+- AOSP 16 `OutputLayer.cpp:415` 的第一条分支：`displayBrightnessNits == sdrWhitePointNits || displayBrightnessNits <= 0 || !layerFEState->dimmingEnabled` → `dimmingRatio = 1.f` 且 `whitePointNits = displayBrightnessNits`。观察值（`496.996185` / `1.000000`）与这条分支完全一致，即 CompositionEngine 的 output state 里两个 nits 相等。
+- 这份 state 只由 HWC 的 `DisplayBrightnessCommand` 能力驱动（SF 里走 `compositionDisplay->setDisplayBrightness(sdrNits, displayNits)` 的分支）；dump 里 `displayBrightness=nullopt` 表示这条路从未被走过。因此 SF 永远不会为该显示请求 per-layer dimming，模块侧也无法请求：`dimmingEnabled` 本来就是 true，`Transaction#setDimmingEnabled` 是 no-op。
+- `Transaction#setSecure(true)` 想让图层的 `isSecure` 触发 `OutputLayer.cpp:308` 的 `forceClientComposition`，实测无效：24 个被压暗的图层带着 `colorTransform=[[0.200,...]]`，HWC entry 仍是 `composition=DEVICE (2)`，图层 dump 里 `secure: 1` 出现 0 次 —— ColorOS 的 SF 忽略普通（非 protected）图层上的 secure 标记。
+- 结论：这台 QC + ColorOS / Android 16 平板上，`setColorTransform` 的可见效果仅限 CLIENT 合成图层（半透明 HUD、对话框、圆角/模糊层）；不透明应用窗口、输入法、系统 UI（DEVICE 合成）在面板上不变暗。让整屏变暗只能强制全局 GPU 合成（`debug.sf.disable_hwcomposer` 一类整体开关），性能开销与「不引入较高性能开销」的目标冲突，故不实现，仅记录。
+
+---
+
 ## 5. 跨设备行为
 
 | 设备形状 | 当前行为 |

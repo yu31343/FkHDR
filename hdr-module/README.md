@@ -1,6 +1,6 @@
 # FkHDR — 独立 HDR 提亮修复模块
 
-> 当前版本：v1.8.0 / versionCode 34（libxposed API 102）。实现细节与 AOSP 基线见 [docs/aosp-alignment.md](../docs/aosp-alignment.md)。
+> 当前版本：v1.8.1 / versionCode 35（libxposed API 102）。实现细节与 AOSP 基线见 [docs/aosp-alignment.md](../docs/aosp-alignment.md)。
 > 状态：Redmi 22041216C / Android 15 / HyperOS 在 v1.7.6 验收通过（专项链系统自算）；一加平板 Pro OPD2404 / Android 16 / ColorOS 在 v1.7.6 验收通过（原生驱动 + GENERIC 兜底，关掉 HDR 后比值 2 秒内回落），v1.8.0 在同一台平板上新增「视频 HDR 时全局压暗 SDR」。静态作用域写在 APK 里，装好启用即可，无需手动勾选作用域。
 
 | 项 | 值 |
@@ -104,7 +104,28 @@ dumpsys SurfaceFlinger: colorTransform=[[0.200,0.000,0.000,0.000][0.000,0.200,0.
 
 关键坑：`Transaction#setColorTransform` 的 16 个 float 在本机由 native 侧按「列主序 3×3」解释（下标 0,1,2 = 第 0 列 = `m00,m10,m20`；3,4,5 = 第 1 列；6,7,8 = 第 2 列）。按行主序填 `(f,0,0, 0,f,0, 0,0,f, …)` 会把绿通道系数落到 `m21`，绿被压成 0、屏幕整体发紫（实测 `colorTransform=[[0.200,0.000,0.000,0.000][0.000,0.000,0.000,0.000][0.000,0.200,0.000,0.000][0.000,0.000,0.000,1.000]]`）。对角必须写在下标 0/4/8。
 
-GAP：只在 ColorOS 路径启用；AOSP 栈走系统自己的 per-layer dimming，不需要也不该重复压暗。HDR 与 SDR 共用同一块背光，这条压暗的前提是「面板亮度已经按比值抬高」（本机由厂商驱动保证）。
+GAP：只在 ColorOS 路径启用；AOSP 栈走系统自己的 per-layer dimming，不需要也不该重复压暗。HDR 与 SDR 共用同一块背光，这条压暗的前提是「面板亮度已经按比值抬高」（本机由厂商驱动保证）。生效范围见下一节的硬件边界。
+
+---
+## v1.8.1：过渡斜坡 + 面板级压暗的硬件边界
+
+两件事：把 SDR 压暗的切换做成平滑斜坡；把「为什么这台机器上压暗只对一部分窗口生效」查到底并写进边界。
+
+过渡斜坡：厂商驱动和 DPU 都拿 `nit/sdrNit` 当比值用，nit 一跳 SDR 就一步变暗/变亮。新增 `publishNit(builder, target, baseline)`，用一阶惯性（`nitSlewTauMs = 220f`，`next = cur + diff * (1 - exp(-dt/tau))`，dt 上限 200ms）把写进 builder 的 nit 拉成斜坡；`boost()`、`hdr nit clamped` 分支、`suppressStaleBoost()` 三处写 nit 的地方都走它，退出 HDR 时重置斜坡状态。
+
+面板级压暗的边界（平板实测，HDR 播放中 `hdrSdrRatio=5.000007`）：
+
+```text
+dumpsys SurfaceFlinger: displayBrightnessNits=496.996185 sdrWhitePointNits=99.399094 ... displayBrightness=nullopt
+Output Layer ×7:        whitePointNits=496.996185 dimmingRatio=1.000000
+Layer state:            dimming enabled=true（全部图层）
+hwc: layer=0x0815d composition=DEVICE (2)
+```
+
+- SurfaceFlinger 自己从不请求逐层压暗：AOSP 16 `OutputLayer.cpp:415` 的第一条分支是 `displayBrightnessNits == sdrWhitePointNits`，我们看到的输出（`whitePointNits` 等于显示亮度、`dimmingRatio=1`）正是这条分支。CompositionEngine 那份 output state 只在 HWC 支持 `DisplayBrightnessCommand` 时被写入，而 `displayBrightness=nullopt` 说明这台一直没进过那条分支。
+- 所以「打开 `setDimmingEnabled` 让 SF 重算」是 no-op：图层状态本来就是 `dimming enabled=true`。
+- `Transaction#setSecure(true)` 逼 CLIENT 合成也没用：HDR 播放中 24 个图层带着 0.2 矩阵，HWC entry 仍是 `composition=DEVICE (2)`，图层 dump 里 `secure: 1` 出现 0 次 —— ColorOS 的 SF 不接受给普通图层打 secure。
+- 结论：颜色矩阵只由 GPU 在合成时执行，因此**只有 CLIENT 合成的图层会在面板上真的变暗**（视频上的半透明 HUD、对话框、圆角/模糊层）；不透明应用窗口、输入法、系统 UI 在这台机器上是 DEVICE 合成，观感不变。要让整屏变暗只能强制全局 GPU 合成，性能开销不可接受，因此不做。
 
 ---
 
@@ -288,5 +309,5 @@ v1.8.0 在同一台平板上复验（探针播放器播 HDR10 测试片）：
 ## 验证与 GAP
 
 - 已完成：7 份切片审查 + AOSP15 基线对照；`git diff --check`、`:app:compileReleaseKotlin`、clean release 构建、`aapt2 dump badging` 通过；两台设备实机验收通过（Android 15 手机专项链 ✔ 4.37 / Android 16 平板原生驱动 + GENERIC ✔ 8.51，截图均已存证）；v1.8.0 的全局 SDR 压暗在 Android 16 平板上实测生效（系数 0.2、17 个窗口、退出还原）。
-- 未完成：其它 ROM；Android 16 上 `sdrToHdrRatioSpline` 缺失，专项链在 Android 16 未验证；多显示器实例隔离；仪器化测试；全局 SDR 压暗只覆盖登记在 `mWindowMap` 的窗口，SurfaceView 子图层（视频本身）按设计不压，游戏全屏 Surface 的观感未单独验证。
+- 未完成：其它 ROM；Android 16 上 `sdrToHdrRatioSpline` 缺失，专项链在 Android 16 未验证；多显示器实例隔离；仪器化测试；全局 SDR 压暗只覆盖登记在 `mWindowMap` 的窗口，SurfaceView 子图层（视频本身）按设计不压，游戏全屏 Surface 的观感未单独验证；且它只对 CLIENT 合成的图层在面板上生效，DEVICE 合成的应用窗口/输入法/系统 UI 不变暗（原因见「v1.8.1」一节的硬件边界）。
 - 不要把 v1.6.1 的历史实测数值当作本版本验收证据。完整契约见 [docs/aosp-alignment.md](../docs/aosp-alignment.md)。

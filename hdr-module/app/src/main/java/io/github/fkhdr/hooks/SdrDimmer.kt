@@ -18,6 +18,15 @@ import java.lang.reflect.Method
  * 窗口自己 colorMode=HDR 时也直接跳过。
  *
  * 覆盖范围是整块屏幕上的所有 SDR 窗口（桌面、状态栏、通知、后台应用），不是只压前台一个窗口。
+ *
+ * 已知边界（一加平板 Pro / QC + ColorOS / Android 16 实测）：
+ * 颜色矩阵由 GPU 在合成时执行，因此只有 CLIENT 合成的图层会在面板上真的变暗
+ * （视频上的半透明 HUD、对话框、圆角/模糊层等）；不透明应用窗口、输入法、系统 UI 在这台机器上
+ * 是 HWC DEVICE 合成，QC 的 composer 收下 setLayerColorTransform 但不执行，观感不变。
+ * 试过的两条补救都没成：① SF 的 CompositionEngine 始终算 dimmingRatio=1.0（
+ * displayBrightnessNits == sdrWhitePointNits，即 HWC 没上报 DisplayBrightnessCommand 能力），
+ * 逐层 DPU dimming 在模块侧无法请求；② 给普通图层打 Transaction#setSecure 不会让
+ * ColorOS 的 SF 强制 CLIENT 合成。所以这里不再尝试强制合成路径，避免引入 GPU 全屏合成的开销。
  */
 internal object SdrDimmer {
     private const val TAG = "FkHDR:SdrDim"
@@ -160,22 +169,18 @@ internal object SdrDimmer {
     /**
      * 4x4 颜色矩阵：RGB 对角缩到 f、alpha 保持 1。
      * f 是亮度比（= 1/ratio），和 AOSP OutputLayer 里 dimmingRatio 的口径一致。
-     * 内存布局按本机 native 的列主序排法写，见下面的注释。
+     * 内存布局按本机 native 的列主序排法写：本机把这 16 个 float 的前 9 个按「列主序 3x3」解释，
+     * 下标 0,1,2 = 第 0 列（m00,m10,m20），3,4,5 = 第 1 列，6,7,8 = 第 2 列。按行主序填
+     * （0,5,10）会把绿通道系数放到 m21、绿被压成 0（实测屏幕发紫），所以对角必须写在下标 0/4/8 上。
      */
-    private fun matrixOf(f: Float): FloatArray {
-        // 本机 native 侧把这 16 个 float 的前 9 个按「列主序 3x3」解释：
-        // 下标 0,1,2 = 第 0 列（m00,m10,m20），3,4,5 = 第 1 列，6,7,8 = 第 2 列。
-        // 按行主序填（0,5,10）会把绿通道系数放到 m21，直接把绿压成 0（实测屏幕发紫），
-        // 所以对角必须写在下标 0/4/8 上。
-        return floatArrayOf(
-            f, 0f, 0f,
-            0f, f, 0f,
-            0f, 0f, f,
-            0f, 0f, 0f,
-            0f, 0f, 0f,
-            1f
-        )
-    }
+    private fun matrixOf(f: Float): FloatArray = floatArrayOf(
+        f, 0f, 0f,
+        0f, f, 0f,
+        0f, 0f, f,
+        0f, 0f, 0f,
+        0f, 0f, 0f,
+        1f
+    )
 
     private fun fmt(v: Float): String = String.format(java.util.Locale.US, "%.3f", v)
 

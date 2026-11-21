@@ -121,6 +121,15 @@ object HdrBoostHook {
     @Volatile private var hdrOn = false
     /** 最近一次观测到的有效 hdr/sdr 比值（ColorOS 路径没有 LocalDisplayDevice 引用时用它压暗 SDR）。 */
     @Volatile private var observedHdrRatio = Float.NaN
+    /**
+     * 平滑后的 nit 发布值。
+     *
+     * 厂商驱动与 DPU 的 SDR 压暗都拿 nit/sdrNit 当比值用：nit 一跳，SDR 层就跟着一步变暗，
+     * 观感是「突然变化」。这里用一阶惯性把 setNit 走一遍斜坡，让比值的动态变化跟随面板
+     * 亮度动画，而不是阶跃。
+     */
+    @Volatile private var publishedNit = Float.NaN
+    private var publishedNitAt = 0L
     @Volatile private var nativeDriver = false
 
     /** 用来主动触发一次亮度重算（兜底路径没有别的触发器） */
@@ -890,7 +899,7 @@ object HdrBoostHook {
             val sdr = num(builder, "getSdrNit")
             if (base.isNaN() || sdr.isNaN() || sdr <= 0f) return false
             if (base / sdr <= 1.02f) return false
-            XpHelpers.callMethod(builder, "setNit", sdr)
+            publishNit(builder, sdr, sdr)
             logEvery("suppress_off", 1000L) {
                 "$TAG: hdr off but vendor boosting " + f2(base) + " -> sdr " +
                     f2(sdr) + " (suppressed)"
@@ -900,6 +909,31 @@ object HdrBoostHook {
             logEvery("suppressfail", 5000L) { "$TAG: suppress failed: " + t }
             false
         }
+    }
+
+    /** 平滑时间常数：约 3 倍 tau（≈0.7s）走完一次 8 倍提亮的斜坡。 */
+    private val nitSlewTauMs = 220f
+
+    /**
+     * 把 nit 目标按一阶惯性平滑后发布给厂商驱动。
+     *
+     * 目标差小于 0.5% 时直接对齐，避免长尾；首次发布以 baseline（sdrNit）为起点，
+     * 所以 HDR 打开时是从「不提亮」顺着斜坡爬上去，而不是一步到位。
+     */
+    private fun publishNit(builder: Any, target: Float, baseline: Float): Float {
+        val now = android.os.SystemClock.uptimeMillis()
+        val dt = if (publishedNitAt == 0L) 16L else (now - publishedNitAt).coerceIn(0L, 200L)
+        publishedNitAt = now
+        val cur = if (publishedNit.isNaN()) baseline else publishedNit
+        val diff = target - cur
+        val next = if (dt <= 0L || Math.abs(diff) <= Math.max(0.5f, Math.abs(target) * 0.005f)) {
+            target
+        } else {
+            cur + diff * (1f - Math.exp((-dt / nitSlewTauMs).toDouble()).toFloat())
+        }
+        publishedNit = next
+        XpHelpers.callMethod(builder, "setNit", next)
+        return next
     }
 
     private fun boost(mgrOrNull: Any?, builder: Any): Boolean {
@@ -930,10 +964,10 @@ object HdrBoostHook {
                 val cur = base / sdr
                 if (cap >= 1f && cur > cap + 0.01f) {
                     val clamped = sdr * cap
-                    XpHelpers.callMethod(builder, "setNit", clamped)
+                    val out = publishNit(builder, clamped, sdr)
                     logEvery("clamphalt", 2000L) {
                         "$TAG: hdr nit clamped " + f2(base) + " -> " + f2(clamped) +
-                            " (ratio " + f2(cur) + " -> cap " + f2(cap) + ")"
+                            " (published " + f2(out) + ", ratio " + f2(cur) + " -> cap " + f2(cap) + ")"
                     }
                     return true
                 }
@@ -973,7 +1007,7 @@ object HdrBoostHook {
             }
             XpHelpers.callMethod(builder, "setHasEdrProcessed")
             XpHelpers.callMethod(builder, "setSdrNit", base)
-            XpHelpers.callMethod(builder, "setNit", target)
+            publishNit(builder, target, base)
             try {
                 XpHelpers.callMethod(builder, "setReason", "FkHDR:HdrFix")
             } catch (_: Throwable) {
@@ -2835,6 +2869,8 @@ object HdrBoostHook {
                         hdrOffSince = 0L
                         noContentSince = 0L
                         lastForcedRatio = Float.NaN
+                        publishedNit = Float.NaN
+                        publishedNitAt = 0L
                     } else {
                         syncRatioCap()
                         refreshSpecificMode()
@@ -2915,6 +2951,9 @@ object HdrBoostHook {
                             if (!want) {
                                 gateUntil = nowMs + 5000L
                                 specFallback = false
+                                // 下一次 HDR 从 sdrNit 起爬，避免沿用上一轮的平滑终点
+                                publishedNit = Float.NaN
+                                publishedNitAt = 0L
                             } else {
                                 lastForcedRatio = Float.NaN
                                 hdrOnSince = nowMs
