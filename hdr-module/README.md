@@ -1,7 +1,7 @@
 # FkHDR — 独立 HDR 提亮修复模块
 
-> 当前版本：v1.7.6 / versionCode 33（libxposed API 102）。实现细节与 AOSP 基线见 [docs/aosp-alignment.md](../docs/aosp-alignment.md)。
-> 状态：两台验收设备都已升级到 v1.7.6 —— Redmi 22041216C / Android 15 / HyperOS（专项链系统自算）、一加平板 Pro OPD2404 / Android 16 / ColorOS（原生驱动 + GENERIC 兜底，关掉 HDR 后比值 2 秒内回落）。静态作用域写在 APK 里，装好启用即可，无需手动勾选作用域。
+> 当前版本：v1.8.0 / versionCode 34（libxposed API 102）。实现细节与 AOSP 基线见 [docs/aosp-alignment.md](../docs/aosp-alignment.md)。
+> 状态：Redmi 22041216C / Android 15 / HyperOS 在 v1.7.6 验收通过（专项链系统自算）；一加平板 Pro OPD2404 / Android 16 / ColorOS 在 v1.7.6 验收通过（原生驱动 + GENERIC 兜底，关掉 HDR 后比值 2 秒内回落），v1.8.0 在同一台平板上新增「视频 HDR 时全局压暗 SDR」。静态作用域写在 APK 里，装好启用即可，无需手动勾选作用域。
 
 | 项 | 值 |
 |---|---|
@@ -80,6 +80,31 @@ t+2    1.0                   718
 ```
 
 1 秒内快速开/关：`t+1 1.28 → t+2 1.82 → t+3 2.52 → t+4 起恒 1.0`，不再反复弹回。真 HDR 视频：`play+2 1.68 → play+5 5.000007` 保持，`stop+4 3.59 → stop+5 1.0`。
+
+## v1.8.0：ColorOS 视频 HDR 的全局 SDR 压暗
+
+问题：ColorOS 上视频 HDR 只把面板亮度顶上去（`mgr pp ran nit=496.99 sdrNit=99.4 brightness=1660.95`），合成器不给 SDR 图层做 per-layer dimming，于是 HDR 内容变亮的同时桌面、播放器 UI 这些 SDR 内容也被一起抬亮，观感就是「只提亮、没压暗」。AOSP 在 `OutputLayer.cpp:351-361` 会算 `dimmingRatio = clamp(sdrWhitePointNits / displayBrightnessNits, 0, 1)` 交给 HWC，但这台设备的 HWC 返回 `DimmingStage::NONE`，不执行这一层。
+
+改法（只在 ColorOS 路径 `hdrOn && !aospMode` 时启用）：`SdrDimmer` 在 system_server 里遍历 `WindowManagerService.mWindowMap` 的全部窗口，给每个窗口的 `SurfaceControl` 下发 `SurfaceControl.Transaction#setColorTransform`（RGB 乘 1/ratio，口径与 AOSP 的 dimmingRatio 相同），最后一次 `apply()` 提交。窗口自己 `colorMode=HDR` 时跳过；视频走 SurfaceView 子图层，父窗口的矩阵不下发到子图层，所以 HDR 内容不受影响。退出 HDR 时下发一次 identity 还原。
+
+- 系数：`f = max(0.05, 1/ratio)`；ratio 优先读 `mCurrentHdrSdrRatio`，ColorOS 路径没有 `LocalDisplayDevice` 引用时退回厂商后处理链里观测到的 `nit/sdrNit`（`observedHdrRatio`）。
+- 没有 HDR 时绝不下发矩阵：颜色矩阵会改变合成路径，所以只在需要压暗时下发，退出时还原一次。
+- 范围是登记在 `mWindowMap` 里的所有窗口（桌面、状态栏、通知、后台应用），不是只压前台一个窗口。
+
+实测（一加平板 Pro / Android 16 / ColorOS，HDR10 测试片，上限 5.0）：
+
+```text
+FkHDR:SdrDim: sdr dim factor=0.200 on 17 window(s), skipped 0 hdr window(s), failed 0 of 17
+dumpsys SurfaceFlinger: colorTransform=[[0.200,0.000,0.000,0.000][0.000,0.200,0.000,0.000][0.000,0.000,0.200,0.000][0.000,0.000,0.000,1.000]
+```
+
+- 播放器 SDR 按钮（截图 (100,2800)-(600,2880) 均值）：播放前 `(95.3, 94.3, 96.2)` → 播放中 `(41.7, 41.7, 42.7)`（线性 0.2）→ 停止后 `(95.3, 94.3, 96.2)`，三通道一致。
+- 同一帧里 HDR 视频的红色条仍是 `(255.0, 0.0, 30.2)`，与不压暗时一致 → HDR 内容没有被一起压。
+- `dumpsys display` 的 `hdrSdrRatio` 播放中 5.000007、停止后 1.0。
+
+关键坑：`Transaction#setColorTransform` 的 16 个 float 在本机由 native 侧按「列主序 3×3」解释（下标 0,1,2 = 第 0 列 = `m00,m10,m20`；3,4,5 = 第 1 列；6,7,8 = 第 2 列）。按行主序填 `(f,0,0, 0,f,0, 0,0,f, …)` 会把绿通道系数落到 `m21`，绿被压成 0、屏幕整体发紫（实测 `colorTransform=[[0.200,0.000,0.000,0.000][0.000,0.000,0.000,0.000][0.000,0.200,0.000,0.000][0.000,0.000,0.000,1.000]]`）。对角必须写在下标 0/4/8。
+
+GAP：只在 ColorOS 路径启用；AOSP 栈走系统自己的 per-layer dimming，不需要也不该重复压暗。HDR 与 SDR 共用同一块背光，这条压暗的前提是「面板亮度已经按比值抬高」（本机由厂商驱动保证）。
 
 ---
 
@@ -208,7 +233,7 @@ cd hdr-module
 
 ---
 
-## 实机验证（v1.7.6）
+## 实机验证（v1.7.6 验收 / v1.8.0 复验）
 
 设备：Redmi 22041216C / Android 15 / HyperOS / LSPosed 2.2.1（`lspctl status` 报 `apiVersion=102`）。验收 App：HDR能力检测 V0.7（`com.lns103.hdrCapability`）。
 
@@ -253,8 +278,15 @@ FkHDR:HdrFix: mgr pp ran nit=846.09485 sdrNit=99.39909 brightness=2047.0
 
 验收 App：HDR SDR调光支持 ✔、HDR SDR调光比率 8.51210、逻辑峰值亮度 1728 cd/m²、HDR显示状态 ✔。
 
+v1.8.0 在同一台平板上复验（探针播放器播 HDR10 测试片）：
+
+- 模块：`init done [platform=coloros ... native=true boost=1 wms=1]`、`panel config ready [sdrToHdrSpline=false]`、`chain = GENERIC(模块代劳, 兜底已安装)`、`sdr dim factor=0.200 on 17 window(s), skipped 0 hdr window(s), failed 0 of 17`。
+- `dumpsys SurfaceFlinger` 出现 `colorTransform=[[0.200,0.000,0.000,0.000][0.000,0.200,0.000,0.000][0.000,0.000,0.200,0.000][0.000,0.000,0.000,1.000]`，停止播放后该行计数归 0。
+- 屏幕像素：SDR 按钮区 `(95.3, 94.3, 96.2)` → `(41.7, 41.7, 42.7)` → 停止后 `(95.3, 94.3, 96.2)`；HDR 视频红条 `(255.0, 0.0, 30.2)` 不受影响。
+- `hdrSdrRatio` 播放中 5.000007、停止后 1.0。
+
 ## 验证与 GAP
 
-- 已完成：7 份切片审查 + AOSP15 基线对照；`git diff --check`、`:app:compileReleaseKotlin`、clean release 构建、`aapt2 dump badging` 通过；两台设备实机验收通过（Android 15 手机专项链 ✔ 4.37 / Android 16 平板原生驱动 + GENERIC ✔ 8.51，截图均已存证）。
-- 未完成：其它 ROM；Android 16 上 `sdrToHdrRatioSpline` 缺失，专项链在 Android 16 未验证；多显示器实例隔离；HDR 关闭后的回落读数存证；仪器化测试。
+- 已完成：7 份切片审查 + AOSP15 基线对照；`git diff --check`、`:app:compileReleaseKotlin`、clean release 构建、`aapt2 dump badging` 通过；两台设备实机验收通过（Android 15 手机专项链 ✔ 4.37 / Android 16 平板原生驱动 + GENERIC ✔ 8.51，截图均已存证）；v1.8.0 的全局 SDR 压暗在 Android 16 平板上实测生效（系数 0.2、17 个窗口、退出还原）。
+- 未完成：其它 ROM；Android 16 上 `sdrToHdrRatioSpline` 缺失，专项链在 Android 16 未验证；多显示器实例隔离；仪器化测试；全局 SDR 压暗只覆盖登记在 `mWindowMap` 的窗口，SurfaceView 子图层（视频本身）按设计不压，游戏全屏 Surface 的观感未单独验证。
 - 不要把 v1.6.1 的历史实测数值当作本版本验收证据。完整契约见 [docs/aosp-alignment.md](../docs/aosp-alignment.md)。

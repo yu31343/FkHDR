@@ -1,8 +1,8 @@
 # AOSP 对齐记录（HDR / hdrSdrRatio）
 
-> 当前实现：FkHDR v1.7.6（versionCode 33，libxposed API 102）。审查对象是 `hdr-module/`；`module/`（legacy API 82）只作历史参考。
+> 当前实现：FkHDR v1.8.0（versionCode 34，libxposed API 102）。审查对象是 `hdr-module/`；`module/`（legacy API 82）只作历史参考。
 > 设计原则：GENERIC 兜底和 watcher 始终安装；专项链路只是运行时健康开关；不把启动期静态探测当作永久事实。
-> 验证状态：静态审查、Kotlin 编译与 clean release 构建通过；v1.7.6 在两台设备验收通过 —— Redmi 22041216C / Android 15（专项链系统自算）与一加平板 Pro OPD2404 / Android 16 / ColorOS（原生驱动 + GENERIC 兜底，关掉 HDR 后比值 2 秒内回落），跨 ROM 缺口见 §8。
+> 验证状态：静态审查、Kotlin 编译与 clean release 构建通过；v1.7.6 在两台设备验收通过 —— Redmi 22041216C / Android 15（专项链系统自算）与一加平板 Pro OPD2404 / Android 16 / ColorOS（原生驱动 + GENERIC 兜底，关掉 HDR 后比值 2 秒内回落）；v1.8.0 在平板上新增视频 HDR 的全局 SDR 压暗并实测生效（§4.10），跨 ROM 缺口见 §8。
 
 ## 1. AOSP Android 15 契约
 
@@ -148,6 +148,21 @@ t+2    1.0                   718
 
 1 秒内快速开/关：`t+1 1.28 → t+2 1.82 → t+3 2.52 → t+4 起恒 1.0`。真 HDR 视频（探针播放器）：`play+2 1.68 → play+5 5.000007`，`stop+4 3.59 → stop+5 1.0`。第二台设备（手机 / AOSP 栈）行为不变：专项链照常，退出仍按原路径回落。
 
+### 4.10 全局 SDR 压暗（v1.8.0，仅 ColorOS 路径）
+
+问题：ColorOS 平板上视频 HDR 把面板亮度按比值抬到上限（`mgr pp ran nit=496.99 sdrNit=99.4 brightness=1660.95`，比值 5.0），但合成器没有执行 AOSP 的 per-layer dimming，SDR 内容跟着一起被抬亮 —— 观感只有提亮、没有压暗。
+
+AOSP 契约在 `frameworks/native` android15-release：`services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp:351-361` 对非 HDR 图层算 `dimmingRatio = clamp(sdrWhitePointNits / displayBrightnessNits, 0.f, 1.f)`，HDR 图层固定 1.0（源码注释写明 HDR 内容既不提亮也不压暗）；`:547-557` 通过 `hwcLayer->setBrightness(dimmingRatio)` 交给 HWC；`services/surfaceflinger/CompositionEngine/src/Display.cpp:358` 的 `clientTargetDimmingStage` 由 HWC 回填，AOSP 默认 `DimmingStage::NONE`。本机 HWC 返回 NONE 且 `supportedHdrTypes=INVALID`，所以这一层请求被丢掉。
+
+实现（`SdrDimmer.kt`）：在 `hdrOn && !aospMode` 时，遍历 `WindowManagerService.mWindowMap` 的全部窗口，对每个窗口的 `SurfaceControl` 下发 `SurfaceControl.Transaction#setColorTransform`，一次 `apply()` 提交；窗口 `colorMode=HDR` 时跳过；退出 HDR 时下发 identity 还原。系数 `f = max(0.05, 1/ratio)`，与 AOSP 的 dimmingRatio 同口径（线性亮度比）。ratio 优先取 `mCurrentHdrSdrRatio`，摸不到 `LocalDisplayDevice` 时退回厂商后处理链里观测到的 `nit/sdrNit`。
+
+选 `setColorTransform` 而不是 `setDimmingEnabled` / `setExtendedRangeBrightness` 的原因：`setDimmingEnabled` 只能让图层退出 dimming，不能施加压暗；`setExtendedRangeBrightness` 的语义是 EDR 比值、不是亮度缩放。
+
+实测（一加平板 Pro，HDR10 测试片，上限 5.0）：模块日志 `sdr dim factor=0.200 on 17 window(s), skipped 0 hdr window(s), failed 0 of 17`；`dumpsys SurfaceFlinger` 里 `colorTransform=[[0.200,0.000,0.000,0.000][0.000,0.200,0.000,0.000][0.000,0.000,0.200,0.000][0.000,0.000,0.000,1.000]`；播放器 SDR 按钮区均值 `(95.3, 94.3, 96.2)` → `(41.7, 41.7, 42.7)` → 停止后复原；同一帧 HDR 视频红条 `(255.0, 0.0, 30.2)` 不变；`hdrSdrRatio` 播放中 5.000007、停止后 1.0。
+
+GAP：只在 ColorOS 路径启用；AOSP 栈由系统自己做 per-layer dimming，不能重复压暗。压暗的前提是面板亮度已按比值抬高（本机由厂商驱动保证）。只覆盖登记在 `mWindowMap` 的窗口，SurfaceView 子图层（视频本体）按设计不压。
+
+---
 ## 5. 跨设备行为
 
 | 设备形状 | 当前行为 |
@@ -159,6 +174,7 @@ t+2    1.0                   718
 | 匿名类序号、合成字段名、方法位置不同 | 动态扫描 + 按类型解析；找不到就退回 GENERIC，不吞掉原方法。 |
 | 拿不到 `DisplayAdapter.getSyncRoot()` / `mSyncRoot` | bypass 放行原方法，直接写入拒绝；不无锁发布 display-changed。 |
 | 厂商定制 `SettingsProvider` 或多显示器 | 白名单写失败会回读提示；多屏实例尚未完整建模，见 §8 GAP。 |
+| HWC 不执行 per-layer dimming（本机 `supportedHdrTypes=INVALID`、`DimmingStage::NONE`） | ColorOS 路径自己给所有 `mWindowMap` 窗口下发颜色矩阵压暗（§4.10）；AOSP 栈交给系统自己做。 |
 
 ## 6. 当前日志对照
 
@@ -234,6 +250,10 @@ libxposed 对同一 `Executable` 用同一 id 重复装钩子做的是原子替�
 
 HDR 内容关掉之后，窗口属性里的 colorMode 可能还带着 HDR（实测残留几十秒），按它判定就会反复「重新开启 HDR → 再退出」。这类设备上要靠 SF 的图层证据（`dataspace=0x188a`、`current hdr/sdr ratio`）判 HDR，窗口属性只在读不到 SF 状态时兜底。另一个后果：厂商驱动不看 SF 图层，照样抬 nit，所以退出时既要压回 nit，也要主动把比值写回 1.0（见 §4.9）。
 
+### 坑 8：`SurfaceControl.Transaction#setColorTransform` 的颜色矩阵按列主序 3×3 解释
+
+本机 native 侧只取前 9 个 float，且按列主序排：下标 0,1,2 = 第 0 列（`m00,m10,m20`），3,4,5 = 第 1 列，6,7,8 = 第 2 列，9–15 被忽略。按行主序填 `(f,0,0, 0,f,0, 0,0,f, …)` 时绿系数落到 `m21`，绿通道被压成 0，屏幕整体发紫（实测 `colorTransform=[[0.200,0.000,0.000,0.000][0.000,0.000,0.000,0.000][0.000,0.200,0.000,0.000][0.000,0.000,0.000,1.000]]`，截图按钮从 `(95.3,94.3,96.2)` 变成 `(41.7,0.0,41.7)`）。对角必须写在下标 0/4/8。
+
 ### v1.6.1 历史实测（不是 v1.6.2 验收）
 
 仓库曾记录一次 Redmi xaga / HyperOS 3 / Android 15 的 HDR10 读数：播放时 `hdrSdrRatio=3.5368757`、`mScreenBrightness=0.013215097`、`hbmMode=hdr`；停止后 `1.0`、`0.0034099757`、`off`，验收 App 显示 ✔️。该记录没有附带可复查的 logcat / dumpsys 文件，且来自旧实现；不能据此声称 v1.6.2 已实机通过。
@@ -245,7 +265,7 @@ HDR 内容关掉之后，窗口属性里的 colorMode 可能还带着 HDR（实�
 - 7 个非重叠切片 reviewer + 1 个 AOSP android15 基线复核，原始结论均为 ISSUES，修复逐条对应。
 - 延迟送达的 final-review 报 R1–R5（亮度量纲、SettingsProvider 嵌套标记、开关关闭写驱动、诊断 readback、注释矛盾），逐项复核后已修复；verifier 的 6 项检查为 PASS、1 条 nit 与 final-review R2 同源。
 - 终审修正后 `:app:compileReleaseKotlin`、`:app:clean :app:assembleRelease --offline`、`git diff --check` 与 `aapt2 dump badging` 全部通过。
-- 版本号 `versionCode = 33` / `versionName = "1.7.6"`，`android.suppressUnsupportedCompileSdk=37` 与 `compileSdk = 37` 一致。
+- 版本号 `versionCode = 34` / `versionName = "1.8.0"`，`android.suppressUnsupportedCompileSdk=37` 与 `compileSdk = 37` 一致。
 
 已完成的实机验证（Redmi 22041216C / Android 15 / HyperOS / LSPosed 2.2.1，框架 apiVersion=102）：
 
@@ -258,6 +278,7 @@ HDR 内容关掉之后，窗口属性里的 colorMode 可能还带着 HDR（实�
 - 应用侧（v1.7.1 修复目标）：验收 App 从「HDR SDR调光支持 ❌ / 比率 1.00000」变为「✔ / 4.37384」；`dumpsys display` 的 `DisplayDeviceInfo` / `mBaseDisplayInfo` / `mOverrideDisplayInfo` 三处 `hdrSdrRatio` 都是有限值，`not_available` 不再出现。
 - watcher 降级仍按设计触发：`specific chain ineffective after 2s (ratio=1.0) -> fallback to GENERIC for this session`（该会话比值恒为 1.0，属预期保护）。
 - APK 内不再有 `de/robv` 引用（`grep -ac de/robv classes.dex` = 0），`META-INF/xposed/{module.prop,java_init.list,scope.list}` 均已打包。
+- v1.8.0 全局 SDR 压暗（一加平板 Pro / Android 16 / ColorOS，探针播放器播 HDR10）：日志 `sdr dim factor=0.200 on 17 window(s), skipped 0 hdr window(s), failed 0 of 17`；`dumpsys SurfaceFlinger` 的 `colorTransform` 三通道均为 0.200；SDR 按钮区像素 `(95.3, 94.3, 96.2)` → `(41.7, 41.7, 42.7)` → 停止后复原；同一帧 HDR 视频红条 `(255.0, 0.0, 30.2)` 不变；`hdrSdrRatio` 播放中 5.000007、停止后 1.0，SF 里压暗矩阵计数归 0。
 
 仍存在的 GAP：
 
@@ -267,6 +288,7 @@ HDR 内容关掉之后，窗口属性里的 colorMode 可能还带着 HDR（实�
 - 未在多种 ROM 上验证拦截器链与 legacy before/after 的顺序差异、合成字段命名、厂商 `SettingsProvider` 行为和 SF dump 输出。
 - 多显示器仍使用部分全局设备快照；`aospDev` 等字段没有按 displayId 完全拆分，需真机多屏回归。
 - 仓库没有单元测试或 instrumentation 测试；反射与线程时序只能靠静态审查和构建证明。
+- 全局 SDR 压暗只覆盖登记在 `mWindowMap` 的窗口；游戏等全屏 Surface / SurfaceView 子图层的观感、以及多显示器时的逐屏系数未验证。
 - 未抓到 `chain -> SPECIFIC` 打印行；专项链生效是从 `ratio bypass ...` 与 `boost skipped (healthy specific chain)` 的副作用日志侧证，不是直接读状态。
 - v1.7.0 曾把 `hdrSdrRatio` 保持成 NaN，导致任何依赖 `isHdrSdrRatioAvailable()` 的应用（不只验收 App）都不上报；v1.7.1 的归一是否对所有 ROM 都安全，仍需跨设备确认。
 
@@ -277,6 +299,7 @@ HDR 内容关掉之后，窗口属性里的 colorMode 可能还带着 HDR（实�
 - [xp/Xp.kt](../hdr-module/app/src/main/java/io/github/fkhdr/xp/Xp.kt)
 - [xp/XpHelpers.kt](../hdr-module/app/src/main/java/io/github/fkhdr/xp/XpHelpers.kt)
 - [HdrBoostHook.kt](../hdr-module/app/src/main/java/io/github/fkhdr/hooks/HdrBoostHook.kt)
+- [SdrDimmer.kt](../hdr-module/app/src/main/java/io/github/fkhdr/hooks/SdrDimmer.kt)
 - [SettingsProviderHook.kt](../hdr-module/app/src/main/java/io/github/fkhdr/hooks/SettingsProviderHook.kt)
 - [Config.kt](../hdr-module/app/src/main/java/io/github/fkhdr/Config.kt)
 - [MainActivity.kt](../hdr-module/app/src/main/java/io/github/fkhdr/ui/MainActivity.kt)

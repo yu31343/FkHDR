@@ -119,6 +119,8 @@ object HdrBoostHook {
     @Volatile private var driverHardenPending: Any? = null
     @Volatile private var wms: Any? = null
     @Volatile private var hdrOn = false
+    /** 最近一次观测到的有效 hdr/sdr 比值（ColorOS 路径没有 LocalDisplayDevice 引用时用它压暗 SDR）。 */
+    @Volatile private var observedHdrRatio = Float.NaN
     @Volatile private var nativeDriver = false
 
     /** 用来主动触发一次亮度重算（兜底路径没有别的触发器） */
@@ -760,6 +762,11 @@ object HdrBoostHook {
                 if (!enabled() || !hdrOn) return
                 logEvery("mpp", 2000L) {
                     val st = param.result
+                    val nit = num(st, "getNit")
+                    val sdrNit = num(st, "getSdrNit")
+                    if (!sdrNit.isNaN() && sdrNit > 0f && !nit.isNaN()) {
+                        observedHdrRatio = Math.max(1f, nit / sdrNit)
+                    }
                     "$TAG: mgr pp ran nit=" + num(st, "getNit") +
                         " sdrNit=" + num(st, "getSdrNit") +
                         " brightness=" + num(st, "getBrightness")
@@ -910,6 +917,9 @@ object HdrBoostHook {
             val base = num(builder, "getNit")
             if (base.isNaN() || base <= 0f) return false
             val sdr = num(builder, "getSdrNit")
+            if (!sdr.isNaN() && sdr > 0f) {
+                observedHdrRatio = Math.min(Math.max(1f, base / sdr), ratioCap())
+            }
             // 压暗对齐：厂商原生驱动会把 nit 直接顶到面板上限（本站实测 99.4 -> 846.09 = 8.51x），
             // 但 SurfaceFlinger 只按自己的 hdr/sdr ratio（本站 5.0）压暗 SDR 层。
             // 两者不一致时 SDR 会按 (8.51/5.0) 偏亮，观感就是「提亮了但没压暗」。
@@ -1532,6 +1542,41 @@ object HdrBoostHook {
     }
 
     private fun currentHdrSdrRatio(): Float = currentHdrSdrRatio(aospDev)
+
+    /**
+     * 压暗 SDR 用的比值：优先读系统字段，ColorOS 上没有 LocalDisplayDevice 引用时
+     * 退回厂商后处理链里观测到的 nit/sdrNit（两者口径相同）。
+     */
+    private fun sdrDimRatio(): Float {
+        val live = currentHdrSdrRatio()
+        if (!live.isNaN() && live >= 1f) return live
+        return observedHdrRatio
+    }
+
+    /**
+     * 当前所有窗口：（WindowState, 该窗口自己是不是画 HDR）。
+     * relayoutWindow 的 args[1] 是 IWindow 代理、拿不到 SurfaceControl，所以直接读 mWindowMap。
+     */
+    private fun collectSdrWindows(): List<Pair<Any, Boolean>> {
+        val w = wms ?: return emptyList()
+        return try {
+            val map = XpHelpers.getObjectField(w, "mWindowMap") as? Map<*, *> ?: return emptyList()
+            val out = ArrayList<Pair<Any, Boolean>>(map.size)
+            for (v in map.values) {
+                val win = v ?: continue
+                val selfHdr = try {
+                    val attrs = XpHelpers.getObjectField(win, "mAttrs")
+                    (XpHelpers.callMethod(attrs, "getColorMode") as? Int ?: 0) == COLOR_MODE_HDR
+                } catch (_: Throwable) {
+                    false
+                }
+                out.add(win to selfHdr)
+            }
+            out
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
 
     // ── 面板 nits 曲线 + 上限曲线（与旧模块「改 displayconfig」等价，但走系统逻辑）──
     //
@@ -2781,6 +2826,7 @@ object HdrBoostHook {
                     if (!enabled()) {
                         trailHandler.removeCallbacks(trailRunnable)
                         pendingRatio.set(null)
+                        SdrDimmer.update(false, 1.0f, collectSdrWindows())
                         hdrWindows.clear()
                         playingPkgs.clear()
                         if (hdrOn) hdrOn = false
@@ -2922,6 +2968,9 @@ object HdrBoostHook {
                                 }
                             }
                         }
+                        // 每轮都对一次 SDR 压暗：进入 HDR 那一刻厂商还没写回比值，
+                        // 只在状态切换时调用会拿到 NaN，压暗永远不生效。
+                        SdrDimmer.update(hdrOn && !aospMode, sdrDimRatio(), collectSdrWindows())
                     }
                 } catch (t: Throwable) {
                     logEvery("watchfail", 5000L) { "$TAG: watcher loop failed: " + t }
