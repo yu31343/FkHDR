@@ -88,8 +88,8 @@ I FkHDR   : writeConfig su fallback failed: java.io.IOException: Cannot run prog
 ## 6. 交付物
 
 ```
-<home>/ftp/FkHDR_v1.0.0_release.apk          # 独立 HDR 模块（703 KB）
-<home>/ftp/FkOScreen_HDRFix_v1.9.4_release.apk  # 原模块（HDR 自动让位）
+<release-dir>/FkHDR_v1.0.0_release.apk          # 独立 HDR 模块（703 KB）
+<release-dir>/FkOScreen_HDRFix_v1.9.4_release.apk  # 原模块（HDR 自动让位）
 ```
 
 安装顺序：先装 FkHDR → LSPosed 启用并勾选「系统框架」+「设置存储」→ 重启。

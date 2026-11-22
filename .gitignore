@@ -23,6 +23,10 @@ analysis/*.png
 # 上游参考仓库（按需重新 clone）
 ref-FkOScreen/
 
+# IDE
+.idea/
+*.iml
+
 # 系统
 .DS_Store
 *.log

@@ -1,3 +1,7 @@
+> 历史记录：本文描述的是早期 legacy 模块（`module/`，Xposed API 82）的实现与实测数值（比率 7.19112）。
+> 当前主线是 `hdr-module/`（libxposed API 102），行为与验收以 [hdr-module/README.md](../../hdr-module/README.md)
+> 和 [docs/aosp-alignment.md](../aosp-alignment.md) 为准。
+
 # ColorOS HDR 修复（最终版：单模块，无 KernelSU）
 
 ## 验收（实测，重启后稳定复现）

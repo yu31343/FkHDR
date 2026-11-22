@@ -71,7 +71,7 @@ cd <repo>/module
 ./gradlew :app:assembleDebug   --offline   # 日常
 ./gradlew :app:assembleRelease --offline   # 发布
 # 产物：module/app/build/outputs/apk/release/app-release.apk
-# 发布：cp 到 <home>/ftp/FkOScreen_HDRFix_vX.Y.Z_release.apk
+# 发布：cp 到 <release-dir>/FkOScreen_HDRFix_vX.Y.Z_release.apk
 ```
 
 改模块后**必须重启**（system_server 才重新加载）。

@@ -1,89 +1,90 @@
-# ColorOS HDR 修复（OPD2404 / 一加平板 Pro / ColorOS 16）
+# FkHDR — ColorOS / HyperOS 的 HDR 提亮修复
 
-修复 ColorOS 上「HDR 内容只压暗、不提亮，SDR/HDR 调光比率恒为 1」的问题。
-验收标准：`com.lns103.hdrCapability`（HDR能力检测 V0.7）开关两态均正常。
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Framework](https://img.shields.io/badge/LSPosed-libxposed%20API%20102-blue.svg)](https://github.com/LSPosed/LSPosed)
 
-## 现象
+ColorOS / HyperOS 的显示栈在播放 HDR 内容时不一定提亮面板，也不一定把真实的 HDR/SDR 比值发布给应用。表现就是「HDR 视频看着没比 SDR 亮」「验收工具显示 ❌ 或比率恒为 1.0」。FkHDR 是一个 LSPosed 模块，把断掉的环节接回去：能走厂商原生提亮链就走原生链，走不通时用 AOSP 的比率链路兜底。
 
-| | 修复前 | 修复后 |
-|---|---|---|
-| App「HDR SDR调光支持」 | ❌ | ✔️ |
-| App「HDR SDR调光比率」 | 1.00000（恒为一） | HDR 关 1.00000 / HDR 开 7.19112 |
-| 面板背光 vs SDR 白点 | 恒等 | HDR 开 2047 / 800 |
-| HDR 内容观感 | 只压暗不提亮 | 面板真实提亮，退出后动画回落 |
+> 当前版本 **v1.8.1 / versionCode 35**，模块框架 **libxposed API 102**（LSPosed 2.x）。
+> 实现细节：[hdr-module/README.md](hdr-module/README.md)　AOSP 逐条对照：[docs/aosp-alignment.md](docs/aosp-alignment.md)
 
-## 根因（逆向 + 实测）
+## 功能
 
-1. **产品配置缺 3 个 OPPO feature**：`enhance_brightness_with_uidimming` /
-   `hdr_enhance_brightness_support` / `dolby_enhance_v1_support`
-   → `LocalDisplayDeviceExtImpl.isSupportSdrToHdrRatio()` 恒 false
-   → `LocalDisplayAdapter:855 handleHdrSdrNitsChanged()` 从不执行
-   → `DisplayInfo.hdrSdrRatio` 停在 `NaN` → `Display.getHdrSdrRatio()` 兜底 `1.0f`
-   → ColorOS 的 HDR 提亮 feature 根本不进亮度后处理链。
-2. **`<hdr_enhance_method>` 白名单表整张缺失**（`display_brightness_app_list.xml`）
-   → `getAppPkgs()` 恒空 → `mEnterWhiteApp` 永远 false → 所有应用都拿不到提亮。
-3. **面板没有 HDR color mode**（`supportedColorModes=[0,7,9]`）
-   → 应用 `setColorMode(COLOR_MODE_HDR)` 时 SurfaceFlinger 不进入 HDR 合成
-   → ColorOS 的 `checkIsPlayingHDR()`（SF transact 21012）恒 0，HDR 开关信号缺失。
-4. **`Builder.setNit()` 会顺手覆盖 sdrNit** → 面板亮了但 SDR 白点跟着变，比率恒 1。
+- **面板提亮**：HDR 内容出现时把面板 nit 顶到上限，退出 HDR 时按系统自己的 DPC 动画回落。
+- **比值发布**：把真实 `hdrSdrRatio` 发布给应用侧（`Display.getHdrSdrRatio()`、`Display.HdrSdrRatioListener`），退出后回落到 `1.0`。
+- **SDR 压暗**：按同一比值压暗 SDR 图层，让 HDR 部分和 SDR 部分亮度一致（过渡走 220ms 斜坡，不是硬切）。
+- **平台无关兜底**：ColorOS 的 feature 开关、应用白名单、私有字段全部失配时自动退到 AOSP 兜底链路。
+- **不碰危险状态位**：不写 `mSupportUltraHDR` / `mForceSurfaceControl`，也不改面板背光通路 —— 这两条都会让屏幕点不亮（见 [docs/aosp-alignment.md](docs/aosp-alignment.md)）。
 
-详细逆向见 [docs/root-cause-framework.md](docs/root-cause-framework.md)、[docs/root-cause-oplus.md](docs/root-cause-oplus.md)。
+## 目录
 
-## 方案（模块只补配置 / 补信号，不实现亮度算法）
-
-`module/app/src/main/java/io/github/fkoscreen/hooks/HdrBoostHook.kt`
-
-| 层 | 做法 |
+| 路径 | 内容 |
 |---|---|
-| 配置 | hook `OplusFeatureConfigManagerService.hasFeature/hasFeatureMap`，补 3 个 feature |
-| 白名单 | **不使用白名单**：直接接管 `mEnterWhiteApp`，任何前台应用都可触发 |
-| 提亮 | 驱动 ColorOS 自己的 `enterEnhanceBrightness()/exitEnhanceBrightness()`（倍数、clamp 到 `getMaxPanelNit()`、亮度动画全部是它的代码） |
-| 比率 | 不写死任何比值：提亮前 `setHasEdrProcessed()` 保住 SDR 白点，系统按**面板硬件上限**推导 `ratio = getMaxPanelNit() / SDR 白点 nit` |
-| 信号 | 焦点窗口 `LayoutParams.colorMode` / relayout 事件 / SF transact 21012 三路取或 |
-| 降级 | 找不到 `OplusFeatureHDREnhanceBrightness` 时回退到 ColorOS 通用 nit 后处理链 |
+| [`hdr-module/`](hdr-module) | **当前主线**：FkHDR 模块本体，包名 `io.github.benbaobaoshigemi.fkhdr`，libxposed API 102 |
+| [`docs/`](docs) | 逆向与对齐记录：AOSP 基线对照、ColorOS 16/17 根因、历史会话 |
+| [`module/`](module) | 历史 legacy 模块（Xposed API 82，FkOScreen 派生）与探针播放器 `module/player/`，只作参考 |
+| [`alternatives/`](alternatives) | 未采用的备选方案（KernelSU 文件替换） |
+| [`contrib/`](contrib) | 可以直接提给上游 FkOScreen 的补丁与诊断脚本 |
 
-所有 hook 都有 try/catch，类不存在则静默跳过，不影响其它 ColorOS 版本/机型。
+## 安装
 
-## 构建与安装
+1. 装 LSPosed 2.x（libxposed API 102）。
+2. `adb install -r fkhdr-v1.8.1.apk`，在 LSPosed 里启用 FkHDR，重启 `system_server` 或整机。
+3. 作用域已经静态写在 APK 里（`system` + `com.android.providers.settings`），不用手动勾选。
+4. 验证：播放 HDR 视频/图片时 `adb shell dumpsys display | grep -i hdrSdrRatio` 应该是真实比值（如 `5.000007`），停止播放后 2 秒内回到 `1.0`。
 
-```bash
-cd module
-JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew assembleDebug --offline
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb reboot          # system_server 需重启才能加载 hook
-```
+> **安装坑**：`adb install -r` 之后 LSPosed 记录的 `apkPath` 可能失效，模块会被静默跳过，日志里是 `Failed to parse package archive .../base.apk`。此时在 LSPosed 里 disable/enable 一次，让它重写路径。
 
-LSPosed 作用域：**系统框架（system）** 必选；其余（SystemUI / 设置 / eyeprotect）按需。
+## 构建
 
-详细构建说明见 [module/BUILD.md](module/BUILD.md)。
-
-## 验证
+需要 JDK 21、Android SDK 37、Gradle 9.8.0、AGP 9.4.1、Kotlin 2.4.20。
 
 ```bash
-adb shell dumpsys display | grep -E '^  mScreenBrightness=|^  mSdrScreenBrightness='
-adb shell dumpsys display | grep -oE 'hdrSdrRatio [0-9.]+'
+cd hdr-module
+echo "sdk.dir=$ANDROID_HOME" > local.properties   # 或用你自己的 SDK 路径
+./gradlew :app:clean :app:assembleRelease --console=plain
+# 产物：hdr-module/app/build/outputs/apk/release/app-release.apk
 ```
 
-| 状态 | mScreenBrightness | mSdrScreenBrightness | hdrSdrRatio |
-|---|---|---|---|
-| HDR 关 | 800 | 800 | 1.0 |
-| HDR 开 | 2047 | 800 | 7.19 |
-| 再关 | 800 | 800 | 1.0 |
+`hdr-module/keystore/fkoscreen-debug.jks` 是随仓库公开的调试签名（alias `fkoscreen`，口令 `android`），只为让 release APK 能直接覆盖安装升级，不要拿去发布。
 
-## 控制与回滚
+## 验收状态
 
-```bash
-adb shell su -c 'setprop persist.sys.fkoscreen.hdr_fix 0'      # 关闭（重启生效）
-adb shell su -c 'setprop persist.sys.fkoscreen.hdr_factor 100' # 提亮倍数，默认 100（会被 clamp 到硬件上限）
-```
+最近一次完整实机验收是 **v1.7.6**，v1.8.0 在同一台平板上复验 SDR 压暗：
+
+| 设备 | 系统 | 结果 |
+|---|---|---|
+| Redmi 22041216C | Android 15 / HyperOS | 专项链（spline + 比值接管）自算，验收 App 比率 4.37、面板提亮 ✔ |
+| 一加平板 Pro OPD2404 | Android 16 / ColorOS | 原生驱动提亮 + GENERIC 兜底，比率 8.51210、逻辑峰值 1728 cd/m²；关掉 HDR 后 2 秒回落 `1.0`；SDR 压暗系数 0.2 覆盖 17 个窗口并复位 |
 
 ## 已知边界
 
-- 面板没有 HDR color mode，本质是「tone-map 到 SDR 容器 + 面板提亮」，不是真正的 HDR 输出链路（硬件限制）。
-- `DisplayDeviceConfig.mHbmData=null`（内屏缺 `display_id_*.xml`）、`lhdr_only_dimming_support`
-  属 vendor/native 层，Java 侧无法修改。
-- 需要 LSPosed（作用域：系统框架）。
+- **只对 GPU 合成（CLIENT）的图层压暗**。SurfaceFlinger 的 `colorTransform` 只在 CLIENT 合成时由 GPU 执行，DEVICE 合成的不透明应用窗口、输入法、系统 UI 不会被压暗。让面板级压暗走 HWC 的 `DisplayBrightnessCommand` 在本机不可行（`mForceSurfaceControl` 为 false、dump 里 `displayBrightness=nullopt`），而强制全局 GPU 合成违背「不引入较高性能开销」的目标，所以不做。详见 [docs/aosp-alignment.md §4.11](docs/aosp-alignment.md)。
+- 压暗只覆盖登记在 `mWindowMap` 的窗口；'SurfaceView 子图层按设计不压（视频本身要亮），全屏游戏 Surface 的观感未单独验证。
+- Android 16 上 `sdrToHdrRatioSpline` 缺失，专项链在 Android 16 未验证，只能走 GENERIC 兜底。
+- 面板本身没有 HDR color mode 的机型，天生是「tone-map 到 SDR 容器 + 面板提亮」，不是真正的 HDR 输出链路 —— 这是硬件限制，不是模块能补的。
+- 其它 ROM、多显示器实例隔离、仪器化测试都还没做。
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [`hdr-module/README.md`](hdr-module/README.md) | 模块当前行为、安装与开关、日志判读、构建与验收记录（**权威**） |
+| [`docs/aosp-alignment.md`](docs/aosp-alignment.md) | 每个钩子对应的 AOSP 代码位置与取舍、三个会黑屏的坑、面板级压暗的硬件边界 |
+| [`docs/root-cause-framework.md`](docs/root-cause-framework.md) | ColorOS 16（Android 16）HDR/SDR 比率与亮度链路的完整逆向 |
+| [`docs/root-cause-oplus.md`](docs/root-cause-oplus.md) | 同一条链路在 OPPO/一加（OPD2404）上的差异 |
+| [`docs/c17-root-cause.md`](docs/c17-root-cause.md) | ColorOS 17（Android 17 / SDK 37）提亮失效的根因 |
+| [`docs/lineage-aosp-no-effect.md`](docs/lineage-aosp-no-effect.md) | 为什么类原生（LineageOS）上这套链路本来就没被调用 |
+| [`docs/hbm-module-coverage.md`](docs/hbm-module-coverage.md) | 设备上现成「改配置 + 反编译 jar」方案的解码与覆盖度对比 |
+| [`docs/fkhdr-standalone.md`](docs/fkhdr-standalone.md) | 为什么把 HDR 链从 FkOScreen 里拆成独立模块 |
+| [`docs/FEATURES.md`](docs/FEATURES.md) | 功能总览（历史版本口径） |
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | 会话交接记录（历史版本口径） |
+| [`docs/history/`](docs/history) | 早期 legacy 模块（`module/`）的验收记录 |
+
+除 `aosp-alignment.md` 与 `hdr-module/README.md` 外，其余 `docs/` 正文都带「历史记录」横幅，只描述当时的样本，不要拿里面的旧数值当当前版本的验收证据。
 
 ## 许可
 
-`module/` 基于 [FkOScreen](https://github.com/benbaobaoshigemi/FkOScreen)（Apache-2.0）二次开发。
+[Apache License 2.0](LICENSE)，Copyright 2026 benbaobaoshigemi。
+
+`module/` 目录衍生自 [FkOScreen](https://github.com/benbaobaoshigemi/FkOScreen)（同样 Apache-2.0）。仓库内不含任何厂商闭源二进制，反编译产物与抓包数据均未入库。
