@@ -10,6 +10,3 @@ local.properties
 /captures
 .externalNativeBuild
 .cxx
-
-# 项目自带 keystore：root .gitignore 有全局 *.jks，这里显式放行，保证签名可复现
-!keystore/fkoscreen-debug.jks

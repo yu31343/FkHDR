@@ -3,6 +3,10 @@
 本目录由 `ref-FkOScreen` 复制而来，并针对本机环境（JDK 21 / Gradle 9.x / Android SDK 37）
 修好了构建链路，可稳定产出可安装 APK。
 
+> 签名文件已从仓库移除（`module/keystore/fkoscreen-debug.jks` 不再入库）。下文提到该文件的步骤需要自己生成一把：
+> `keytool -genkeypair -keystore module/keystore/fkoscreen-debug.jks -alias fkoscreen -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -validity 10000`；
+> 没有这个文件时，构建脚本会退回 AGP 默认的 debug 签名。
+
 ## 1. 最终版本组合
 
 | 组件 | 版本 | 说明 |

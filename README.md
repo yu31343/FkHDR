@@ -46,7 +46,12 @@ echo "sdk.dir=$ANDROID_HOME" > local.properties   # 或用你自己的 SDK 路�
 # 产物：hdr-module/app/build/outputs/apk/release/app-release.apk
 ```
 
-`hdr-module/keystore/fkoscreen-debug.jks` 是随仓库公开的调试签名（alias `fkoscreen`，口令 `android`），只为让 release APK 能直接覆盖安装升级，不要拿去发布。
+仓库里**不存放任何签名文件**（`*.jks` 已在 `.gitignore` 里）。构建脚本会检查 `hdr-module/keystore/fkoscreen-debug.jks`：
+
+- 本地有：debug/release 都用它签（alias `fkoscreen`、口令 `android`），能覆盖安装自己之前的构建产物；
+- 本地没有：release 退回 AGP 默认的 debug 签名（`~/.android/debug.keystore`，首次构建自动生成）。
+
+这样从源码构建出来的 APK 与官方发布包签名不同，覆盖安装会被系统拒绝，需要先卸载再装。正式发布请换成自己的 key，不要用调试签名。
 
 ## 验收状态
 

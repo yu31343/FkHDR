@@ -252,6 +252,8 @@ cd hdr-module
 
 要求：JDK 21、Android SDK 37、Gradle 9.8.0、AGP 9.4.1、Kotlin 2.4.20。`android.suppressUnsupportedCompileSdk=37` 与 `compileSdk = 37` 匹配。
 
+签名：仓库不含 keystore。本地有 `keystore/fkoscreen-debug.jks` 时 debug/release 都用它签；没有就退回 AGP 默认 debug 签名，产物可直接安装，但与官方发布包签名不同、不能覆盖安装。
+
 ---
 
 ## 实机验证（v1.7.6 验收 / v1.8.0 复验）

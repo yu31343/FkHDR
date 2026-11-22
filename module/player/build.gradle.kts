@@ -14,24 +14,31 @@ android {
         versionName = "1.0"
     }
 
+    // 仓库不带签名文件；本地放了 keystore/fkoscreen-debug.jks 就用它，否则退回 AGP 默认 debug 签名。
+    val localKeystore = rootProject.file("keystore/fkoscreen-debug.jks")
+
     signingConfigs {
-        // 复用主工程 keystore，保证 adb install -r 不会因签名变化失败
-        create("localDebug") {
-            storeFile = rootProject.file("keystore/fkoscreen-debug.jks")
-            storePassword = "android"
-            keyAlias = "fkoscreen"
-            keyPassword = "android"
+        if (localKeystore.exists()) {
+            create("localDebug") {
+                storeFile = localKeystore
+                storePassword = "android"
+                keyAlias = "fkoscreen"
+                keyPassword = "android"
+            }
         }
     }
 
     buildTypes {
+        val signer =
+            if (localKeystore.exists()) signingConfigs.getByName("localDebug")
+            else signingConfigs.getByName("debug")
         debug {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("localDebug")
+            signingConfig = signer
         }
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("localDebug")
+            signingConfig = signer
         }
     }
 

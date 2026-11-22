@@ -19,24 +19,32 @@ android {
         versionName = "1.8.1"
     }
 
+    // 仓库不带签名文件。本地放了 keystore/fkoscreen-debug.jks 就用它（能和已装的旧版覆盖升级），
+    // 没放就退回 AGP 默认的 debug 签名（~/.android/debug.keystore，首次构建自动生成）。
+    val localKeystore = rootProject.file("keystore/fkoscreen-debug.jks")
+
     signingConfigs {
-        // 与 module/ 共用同一 keystore，保证 debug/release 签名一致，install -r 不会因签名变化失败
-        create("localDebug") {
-            storeFile = rootProject.file("keystore/fkoscreen-debug.jks")
-            storePassword = "android"
-            keyAlias = "fkoscreen"
-            keyPassword = "android"
+        if (localKeystore.exists()) {
+            create("localDebug") {
+                storeFile = localKeystore
+                storePassword = "android"
+                keyAlias = "fkoscreen"
+                keyPassword = "android"
+            }
         }
     }
 
     buildTypes {
+        val signer =
+            if (localKeystore.exists()) signingConfigs.getByName("localDebug")
+            else signingConfigs.getByName("debug")
         debug {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("localDebug")
+            signingConfig = signer
         }
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("localDebug")
+            signingConfig = signer
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

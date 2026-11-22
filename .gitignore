@@ -5,7 +5,7 @@ module/.gradle/
 module/.kotlin/
 *.apk
 *.jks
-!module/keystore/fkoscreen-debug.jks
+# 签名文件不入库：本地自备 keystore/fkoscreen-debug.jks，构建脚本检测到才会用它
 local.properties
 
 # 逆向中间产物（体积大，可重新生成）
